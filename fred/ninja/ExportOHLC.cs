@@ -15,6 +15,9 @@ using NinjaTrader.Gui;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 using DuckDB.NET.Data;
+// Plexus bus integration — uses IPlexusService.RegisterMethod (v0.7+) to expose
+// historical.* RPCs over the bus without modifying PlexusAddOn/PlexusNTBridge.
+using Plexus;
 #endregion
 
 namespace NinjaTrader.NinjaScript.AddOns
@@ -57,12 +60,299 @@ namespace NinjaTrader.NinjaScript.AddOns
         private NTMenuItem menuItem;
         private NTMenuItem existingMenu;
 
+        // Plexus bus RPC registration tokens. Filled on State.Active when
+        // PlexusAddOn is available; disposed on State.Terminated.
+        // We try registration but never fail the AddOn if PlexusAddOn is
+        // not deployed — the menu-driven export still works standalone.
+        private readonly List<IDisposable> _plexusRpcTokens = new List<IDisposable>();
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
             {
-                Description = "Export ALL OHLC history from all contracts";
+                Description = "Export ALL OHLC history from all contracts; exposes historical.* over Plexus bus";
                 Name = "ExportOHLC";
+            }
+            else if (State == State.Active)
+            {
+                // Register the historical.* RPCs on the bus. If PlexusAddOn
+                // isn't loaded, RegisterMethod returns a no-op disposable —
+                // safe to ignore. AddOn-load order doesn't matter because
+                // PlexusServiceImpl queues registrations and re-applies on
+                // every CreateBusClient/RestartBus.
+                TryRegisterPlexusRpcs();
+            }
+            else if (State == State.Terminated)
+            {
+                foreach (var t in _plexusRpcTokens) { try { t.Dispose(); } catch { } }
+                _plexusRpcTokens.Clear();
+            }
+        }
+
+        private void TryRegisterPlexusRpcs()
+        {
+            try
+            {
+                var svc = PlexusService.Instance;
+                _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_instruments",  HandleListInstrumentsRpc));
+                _plexusRpcTokens.Add(svc.RegisterMethod("historical.check_inventory",   HandleCheckInventoryRpc));
+                _plexusRpcTokens.Add(svc.RegisterMethod("historical.fetch_bars",        HandleFetchBarsRpc));
+                _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_periods",      HandleListPeriodsRpc));
+                Log("[plexus] Registered historical.* RPCs (list_instruments, check_inventory, fetch_bars, list_periods).");
+            }
+            catch (Exception ex)
+            {
+                // Defensive — should never throw because NullPlexusService is
+                // returned when AddOn missing. But if PlexusBridge.dll isn't
+                // even loadable we'd get a TypeLoadException here.
+                Log($"[plexus] RPC registration failed (PlexusBridge.dll may be missing): {ex.Message}");
+            }
+        }
+
+        // ===================================================================
+        // Plexus bus RPC handlers
+        // ===================================================================
+        // Common conventions for these handlers:
+        //  * payloadObj is the deserialized JSON request body — always a
+        //    Dictionary<string, object?> in practice.
+        //  * Return a Dictionary<string, object?> (becomes the JSON response).
+        //  * On error: throw — BusClient wraps the exception into a
+        //    method_response error envelope for the caller.
+        //  * All bar pulls use MergePolicy.DoNotMerge — LOCAL CACHE ONLY,
+        //    never triggers provider downloads. Same safety as the menu UI.
+
+        /// <summary>
+        /// historical.list_instruments(symbol_root="MNQ") -> [{instrument, expiry, exchange, ...}]
+        /// Enumerates Instrument.All filtered to symbol_root. Same scan the
+        /// menu-driven export uses (line 511-525 in this file).
+        /// </summary>
+        private object HandleListInstrumentsRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string symbolRoot = ReadString(payload, "symbol_root", required: true);
+
+            var contracts = new List<Instrument>();
+            foreach (var inst in Instrument.All)
+            {
+                if (inst.MasterInstrument != null &&
+                    inst.MasterInstrument.Name == symbolRoot &&
+                    inst.MasterInstrument.InstrumentType == InstrumentType.Future)
+                {
+                    contracts.Add(inst);
+                }
+            }
+            contracts = contracts.OrderBy(c => c.Expiry).ToList();
+
+            var result = new List<object>();
+            foreach (var c in contracts)
+            {
+                result.Add(new Dictionary<string, object>
+                {
+                    ["full_name"]  = c.FullName,
+                    ["expiry_iso"] = c.Expiry.ToString("yyyy-MM-dd"),
+                    ["exchange"]   = c.Exchange.ToString(),
+                });
+            }
+            return new Dictionary<string, object>
+            {
+                ["symbol_root"] = symbolRoot,
+                ["count"]       = contracts.Count,
+                ["instruments"] = result,
+            };
+        }
+
+        /// <summary>
+        /// historical.list_periods() -> {supported: [...]}
+        /// Convenience for clients to discover what `period_type` values
+        /// the other RPCs accept.
+        /// </summary>
+        private object HandleListPeriodsRpc(object payloadObj)
+        {
+            return new Dictionary<string, object>
+            {
+                ["supported"] = new List<string> { "Tick", "Second", "Minute", "Day" },
+                ["market_data_types"] = new List<string> { "Last", "Bid", "Ask" },
+                ["note"] = "For hourly bars: use period_type=Minute with period_value=60. NT has no native Hour type.",
+                ["merge_policy"] = "DoNotMerge (local cache only — never triggers provider downloads)",
+            };
+        }
+
+        /// <summary>
+        /// historical.check_inventory(symbol_root, period_type, period_value=1, market_data_type="Last")
+        ///   -> per-contract date ranges + bar counts of LOCAL cache.
+        /// Issues a small BarsRequest per contract to measure what's there
+        /// without actually downloading the full series.
+        /// </summary>
+        private object HandleCheckInventoryRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string symbolRoot = ReadString(payload, "symbol_root", required: true);
+            string periodTypeStr = ReadString(payload, "period_type", required: false) ?? "Minute";
+            int periodValue = ReadInt(payload, "period_value", defaultValue: 1);
+            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "Last";
+
+            BarsPeriodType periodType = ParsePeriodType(periodTypeStr);
+            MarketDataType mdType = ParseMarketDataType(mdTypeStr);
+
+            var contracts = Instrument.All.Where(i =>
+                i.MasterInstrument != null &&
+                i.MasterInstrument.Name == symbolRoot &&
+                i.MasterInstrument.InstrumentType == InstrumentType.Future)
+                .OrderBy(c => c.Expiry)
+                .ToList();
+
+            var inventory = new List<object>();
+            // Probe a wide window (1990 -> now) with DoNotMerge so NT returns
+            // only what's cached locally — fast and cost-free.
+            DateTime probeStart = new DateTime(1990, 1, 1);
+            DateTime probeEnd   = DateTime.Now;
+            foreach (var c in contracts)
+            {
+                var bars = GetOHLCFromContract(c, periodType, periodValue, mdType, probeStart, probeEnd, out _);
+                var entry = new Dictionary<string, object>
+                {
+                    ["full_name"]    = c.FullName,
+                    ["expiry_iso"]   = c.Expiry.ToString("yyyy-MM-dd"),
+                    ["bar_count"]    = bars.Count,
+                };
+                if (bars.Count > 0)
+                {
+                    entry["first_bar_iso"] = bars[0].Time.ToUniversalTime().ToString("o");
+                    entry["last_bar_iso"]  = bars[bars.Count - 1].Time.ToUniversalTime().ToString("o");
+                }
+                inventory.Add(entry);
+            }
+            return new Dictionary<string, object>
+            {
+                ["symbol_root"]      = symbolRoot,
+                ["period_type"]      = periodTypeStr,
+                ["period_value"]     = periodValue,
+                ["market_data_type"] = mdTypeStr,
+                ["contracts"]        = inventory,
+            };
+        }
+
+        /// <summary>
+        /// historical.fetch_bars(instrument="MNQ 06-26", period_type, period_value, from_iso, to_iso, market_data_type)
+        ///   -> bars in [from_iso, to_iso] for that one contract.
+        ///
+        /// Per-call size limit: enforced to keep responses bus-safe. Caller
+        /// paginates by walking from_iso forward.
+        ///   - Tick:  max 1 day per call (can be hundreds of MB)
+        ///   - Sec:   max 1 day per call
+        ///   - Min:   max 31 days per call
+        ///   - Hour/Day: max 5 years per call
+        /// </summary>
+        private object HandleFetchBarsRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string instrumentFullName = ReadString(payload, "instrument", required: true);
+            string periodTypeStr = ReadString(payload, "period_type", required: true);
+            int periodValue = ReadInt(payload, "period_value", defaultValue: 1);
+            string fromIso = ReadString(payload, "from_iso", required: true);
+            string toIso   = ReadString(payload, "to_iso",   required: true);
+            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "Last";
+
+            DateTime fromDt = DateTime.Parse(fromIso).ToUniversalTime();
+            DateTime toDt   = DateTime.Parse(toIso).ToUniversalTime();
+            if (toDt <= fromDt) throw new ArgumentException("to_iso must be > from_iso");
+
+            BarsPeriodType periodType = ParsePeriodType(periodTypeStr);
+            MarketDataType mdType = ParseMarketDataType(mdTypeStr);
+
+            // Per-call size guard. Minute-with-value-60 (= hourly bars) sized
+            // generously since 1 hour = 60 min ≈ 17K bars/year, well within limits.
+            var span = toDt - fromDt;
+            int maxDays;
+            if (periodType == BarsPeriodType.Tick)        maxDays = 1;
+            else if (periodType == BarsPeriodType.Second) maxDays = 1;
+            else if (periodType == BarsPeriodType.Minute && periodValue >= 60) maxDays = 365 * 5;  // hourly+
+            else if (periodType == BarsPeriodType.Minute) maxDays = 31;
+            else if (periodType == BarsPeriodType.Day)    maxDays = 365 * 50;
+            else                                          maxDays = 31;
+            if (span.TotalDays > maxDays)
+                throw new ArgumentException(
+                    $"Requested range {span.TotalDays:F1} days exceeds per-call limit of {maxDays} days for period_type={periodTypeStr}. " +
+                    $"Caller must paginate.");
+
+            var inst = Instrument.GetInstrument(instrumentFullName);
+            if (inst == null) throw new ArgumentException($"Instrument not found: {instrumentFullName}");
+
+            // Reuse the existing battle-tested local-cache reader. Returns
+            // empty list if no data; bars are already date-range-filtered.
+            var bars = GetOHLCFromContract(inst, periodType, periodValue, mdType, fromDt, toDt, out string diag);
+
+            // Serialize bars to dict format (matches Plexus.Bus.Trading.Bar shape)
+            var barList = new List<object>(bars.Count);
+            foreach (var b in bars)
+            {
+                barList.Add(new Dictionary<string, object>
+                {
+                    ["timestamp_iso"] = b.Time.ToUniversalTime().ToString("o"),
+                    ["open"]   = b.Open,
+                    ["high"]   = b.High,
+                    ["low"]    = b.Low,
+                    ["close"]  = b.Close,
+                    ["volume"] = b.Volume,
+                });
+            }
+            return new Dictionary<string, object>
+            {
+                ["instrument"]       = inst.FullName,
+                ["period_type"]      = periodTypeStr,
+                ["period_value"]     = periodValue,
+                ["market_data_type"] = mdTypeStr,
+                ["from_iso"]         = fromIso,
+                ["to_iso"]           = toIso,
+                ["bar_count"]        = bars.Count,
+                ["bars"]             = barList,
+                ["diagnostic"]       = diag,  // may be null
+            };
+        }
+
+        // -------------------------------------------------------------------
+        // Payload parsing helpers
+        // -------------------------------------------------------------------
+
+        private static string ReadString(IDictionary<string, object> p, string key, bool required)
+        {
+            if (!p.TryGetValue(key, out object v) || v == null)
+            {
+                if (required) throw new ArgumentException($"Missing required field: {key}");
+                return null;
+            }
+            return Convert.ToString(v);
+        }
+
+        private static int ReadInt(IDictionary<string, object> p, string key, int defaultValue)
+        {
+            if (!p.TryGetValue(key, out object v) || v == null) return defaultValue;
+            try { return Convert.ToInt32(v); }
+            catch { throw new ArgumentException($"Field '{key}' must be an integer"); }
+        }
+
+        private static BarsPeriodType ParsePeriodType(string s)
+        {
+            switch (s)
+            {
+                case "Tick":   return BarsPeriodType.Tick;
+                case "Second": return BarsPeriodType.Second;
+                case "Minute": return BarsPeriodType.Minute;
+                case "Day":    return BarsPeriodType.Day;
+                default: throw new ArgumentException(
+                    $"Unsupported period_type: {s}. Use Tick/Second/Minute/Day " +
+                    "(hourly = Minute with period_value=60).");
+            }
+        }
+
+        private static MarketDataType ParseMarketDataType(string s)
+        {
+            switch (s)
+            {
+                case "Last": return MarketDataType.Last;
+                case "Bid":  return MarketDataType.Bid;
+                case "Ask":  return MarketDataType.Ask;
+                default: throw new ArgumentException($"Unsupported market_data_type: {s}");
             }
         }
 
