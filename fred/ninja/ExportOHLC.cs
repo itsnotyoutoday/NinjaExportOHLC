@@ -93,19 +93,30 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try
             {
-                var svc = PlexusService.Instance;
-                _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_instruments",  HandleListInstrumentsRpc));
-                _plexusRpcTokens.Add(svc.RegisterMethod("historical.check_inventory",   HandleCheckInventoryRpc));
-                _plexusRpcTokens.Add(svc.RegisterMethod("historical.fetch_bars",        HandleFetchBarsRpc));
-                _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_periods",      HandleListPeriodsRpc));
-                Log("[plexus] Registered historical.* RPCs (list_instruments, check_inventory, fetch_bars, list_periods).");
+                // PlexusService.WhenAvailable handles AddOn load-order:
+                //   - If PlexusAddOn already registered (rare for us since 'E' < 'P'),
+                //     callback fires immediately.
+                //   - If not (typical), callback queues until PlexusAddOn's
+                //     OnStateChange(Active) calls PlexusService.Register.
+                PlexusService.WhenAvailable(svc =>
+                {
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_instruments",  HandleListInstrumentsRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.check_inventory",   HandleCheckInventoryRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.fetch_bars",        HandleFetchBarsRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_periods",      HandleListPeriodsRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.download",          HandleDownloadRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.download_status",   HandleDownloadStatusRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.download_cancel",   HandleDownloadCancelRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_downloads",    HandleListDownloadsRpc));
+                    // AddOnBase.Log(message, LogLevel) -- NinjaScript base class signature requires LogLevel.
+                    Log("[plexus] Registered historical.* RPCs (list_instruments, check_inventory, fetch_bars, list_periods, download, download_status, download_cancel, list_downloads).", LogLevel.Information);
+                });
             }
             catch (Exception ex)
             {
-                // Defensive — should never throw because NullPlexusService is
-                // returned when AddOn missing. But if PlexusBridge.dll isn't
-                // even loadable we'd get a TypeLoadException here.
-                Log($"[plexus] RPC registration failed (PlexusBridge.dll may be missing): {ex.Message}");
+                // PlexusBridge.dll may not be loadable (TypeLoadException) if it's
+                // missing from NT's Custom dir.
+                Log($"[plexus] RPC registration setup failed (PlexusBridge.dll may be missing): {ex.Message}", LogLevel.Warning);
             }
         }
 
@@ -208,7 +219,10 @@ namespace NinjaTrader.NinjaScript.AddOns
             DateTime probeEnd   = DateTime.Now;
             foreach (var c in contracts)
             {
-                var bars = GetOHLCFromContract(c, periodType, periodValue, mdType, probeStart, probeEnd, out _);
+                // GetOHLCFromContract is internal static on ExportOHLCWindow
+                // (so both the menu-driven export AND these RPC handlers can
+                //  call the same battle-tested BarsRequest path).
+                var bars = ExportOHLCWindow.GetOHLCFromContract(c, periodType, periodValue, mdType, probeStart, probeEnd, out _);
                 var entry = new Dictionary<string, object>
                 {
                     ["full_name"]    = c.FullName,
@@ -280,7 +294,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
             // Reuse the existing battle-tested local-cache reader. Returns
             // empty list if no data; bars are already date-range-filtered.
-            var bars = GetOHLCFromContract(inst, periodType, periodValue, mdType, fromDt, toDt, out string diag);
+            var bars = ExportOHLCWindow.GetOHLCFromContract(inst, periodType, periodValue, mdType, fromDt, toDt, out string diag);
 
             // Serialize bars to dict format (matches Plexus.Bus.Trading.Bar shape)
             var barList = new List<object>(bars.Count);
@@ -354,6 +368,296 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "Ask":  return MarketDataType.Ask;
                 default: throw new ArgumentException($"Unsupported market_data_type: {s}");
             }
+        }
+
+        // ===================================================================
+        // Background download jobs: chunked, cancellable, pollable
+        // ===================================================================
+        // historical.download triggers a background Task that walks the
+        // requested [from, to] range in chunks. Per-chunk size depends on
+        // period_type (Tick=1d, Sec=1d, Min=7d, Min*60+=30d, Day=1yr) so each
+        // chunk completes in bounded time and we get progress visibility.
+        //
+        // Each chunk uses MergePolicy.MergeBackAdjusted, which means NT will
+        // FETCH from the connected data provider (Continuum) if the data
+        // isn't already in local cache — that's the whole point: trigger
+        // new downloads, not just read what's there.
+        //
+        // Cancellation: each chunk checks the CancellationToken before
+        // starting. NT's BarsRequest has no Cancel API, so the current
+        // chunk runs to completion (or its 5-min timeout) before cancel
+        // takes effect. Worst case: cancel acks within 5 min — vastly
+        // better than NT HDM's "hangs forever, no status."
+
+        private class DownloadJob
+        {
+            public string Id;
+            public string Instrument;
+            public string PeriodType;
+            public int PeriodValue;
+            public string MarketDataType;
+            public DateTime From;
+            public DateTime To;
+            public List<(DateTime from, DateTime to)> Chunks;
+            public System.Threading.CancellationTokenSource Cts;
+            public DateTime StartedAt;
+            public DateTime? FinishedAt;
+            public volatile int ChunksDone;
+            public volatile int BarsDownloaded;
+            public DateTime? CurrentChunkFrom;
+            public DateTime? CurrentChunkTo;
+            public string Status = "running"; // running | complete | failed | cancelled
+            public string Error;
+
+            public int ChunksTotal => Chunks?.Count ?? 0;
+            public double ElapsedSec => ((FinishedAt ?? DateTime.UtcNow) - StartedAt).TotalSeconds;
+            public double? EtaSec => (ChunksDone > 0 && Status == "running")
+                ? (ElapsedSec / ChunksDone) * (ChunksTotal - ChunksDone) : (double?)null;
+        }
+
+        // Static so jobs survive AddOn instance churn within the NT process.
+        // ConcurrentDictionary is thread-safe for the read paths used by status polling.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DownloadJob>
+            _activeDownloads = new System.Collections.Concurrent.ConcurrentDictionary<string, DownloadJob>();
+
+        // Per-period chunk size (days) — chosen to keep each chunk's BarsRequest
+        // under ~5 min wall time and bound memory per chunk.
+        private static int ChunkSizeDays(BarsPeriodType periodType, int periodValue)
+        {
+            if (periodType == BarsPeriodType.Tick)   return 1;
+            if (periodType == BarsPeriodType.Second) return 1;
+            if (periodType == BarsPeriodType.Day)    return 365;
+            // Minute: 7 days for sub-hour, 30 for >=hourly
+            if (periodType == BarsPeriodType.Minute) return periodValue >= 60 ? 30 : 7;
+            return 7;
+        }
+
+        private static List<(DateTime from, DateTime to)> ChunkRange(DateTime from, DateTime to, int chunkDays)
+        {
+            var chunks = new List<(DateTime from, DateTime to)>();
+            DateTime cur = from;
+            while (cur < to)
+            {
+                DateTime next = cur.AddDays(chunkDays);
+                if (next > to) next = to;
+                chunks.Add((cur, next));
+                cur = next;
+            }
+            return chunks;
+        }
+
+        /// <summary>
+        /// historical.download(instrument, period_type, period_value, from_iso, to_iso, market_data_type)
+        ///   -> {ok, download_id, chunks_total, estimated_time_sec}
+        ///
+        /// Starts a background download. Returns IMMEDIATELY with a job id.
+        /// Poll historical.download_status(id) for progress.
+        /// Cancel via historical.download_cancel(id).
+        /// </summary>
+        private object HandleDownloadRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string instrumentName = ReadString(payload, "instrument", required: true);
+            string periodTypeStr = ReadString(payload, "period_type", required: true);
+            int periodValue = ReadInt(payload, "period_value", defaultValue: 1);
+            string fromIso = ReadString(payload, "from_iso", required: true);
+            string toIso = ReadString(payload, "to_iso", required: true);
+            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "Last";
+
+            var inst = Instrument.GetInstrument(instrumentName);
+            if (inst == null) throw new ArgumentException($"Instrument not found: {instrumentName}");
+
+            DateTime fromDt = DateTime.Parse(fromIso).ToUniversalTime();
+            DateTime toDt   = DateTime.Parse(toIso).ToUniversalTime();
+            if (toDt <= fromDt) throw new ArgumentException("to_iso must be > from_iso");
+
+            BarsPeriodType periodType = ParsePeriodType(periodTypeStr);
+            MarketDataType mdType = ParseMarketDataType(mdTypeStr);
+
+            int chunkDays = ChunkSizeDays(periodType, periodValue);
+            var chunks = ChunkRange(fromDt, toDt, chunkDays);
+
+            string id = Guid.NewGuid().ToString("N").Substring(0, 8);
+            var job = new DownloadJob
+            {
+                Id = id,
+                Instrument = inst.FullName,
+                PeriodType = periodTypeStr,
+                PeriodValue = periodValue,
+                MarketDataType = mdTypeStr,
+                From = fromDt, To = toDt,
+                Chunks = chunks,
+                Cts = new System.Threading.CancellationTokenSource(),
+                StartedAt = DateTime.UtcNow,
+            };
+            _activeDownloads[id] = job;
+
+            // Background task — fire-and-forget. Result tracked in job state.
+            System.Threading.Tasks.Task.Run(() => RunDownloadJob(job, inst, periodType, mdType));
+
+            // Conservative ETA: 30s/chunk for tick, 10s/chunk for higher periods.
+            double secPerChunk = periodType == BarsPeriodType.Tick ? 30 : 10;
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["download_id"] = id,
+                ["instrument"] = inst.FullName,
+                ["period_type"] = periodTypeStr,
+                ["period_value"] = periodValue,
+                ["market_data_type"] = mdTypeStr,
+                ["from_iso"] = fromDt.ToString("o"),
+                ["to_iso"] = toDt.ToString("o"),
+                ["chunks_total"] = chunks.Count,
+                ["chunk_size_days"] = chunkDays,
+                ["estimated_time_sec"] = chunks.Count * secPerChunk,
+                ["message"] = "Download started. Poll historical.download_status with this id, or cancel with historical.download_cancel.",
+            };
+        }
+
+        // Runs in a background Task. Walks chunks, updating job state.
+        private void RunDownloadJob(DownloadJob job, Instrument inst, BarsPeriodType periodType, MarketDataType mdType)
+        {
+            try
+            {
+                for (int i = 0; i < job.Chunks.Count; i++)
+                {
+                    if (job.Cts.IsCancellationRequested)
+                    {
+                        job.Status = "cancelled";
+                        job.FinishedAt = DateTime.UtcNow;
+                        return;
+                    }
+                    var (cFrom, cTo) = job.Chunks[i];
+                    job.CurrentChunkFrom = cFrom;
+                    job.CurrentChunkTo = cTo;
+
+                    int chunkBars = DownloadChunk(inst, periodType, job.PeriodValue, mdType, cFrom, cTo);
+                    job.BarsDownloaded += chunkBars;
+                    job.ChunksDone++;
+                }
+                job.Status = "complete";
+                job.FinishedAt = DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                job.Status = "failed";
+                job.Error = ex.Message;
+                job.FinishedAt = DateTime.UtcNow;
+            }
+        }
+
+        // Single chunk: BarsRequest with MergeBackAdjusted (fetches from
+        // Continuum if missing locally). Returns the bar count for progress.
+        private int DownloadChunk(Instrument inst, BarsPeriodType periodType, int periodValue,
+                                  MarketDataType mdType, DateTime fromDt, DateTime toDt)
+        {
+            int count = 0;
+            var request = new BarsRequest(inst, fromDt, toDt);
+            request.BarsPeriod = new BarsPeriod
+            {
+                BarsPeriodType = periodType,
+                Value = periodValue,
+                MarketDataType = mdType,
+            };
+            request.TradingHours = TradingHours.Get("Default 24 x 7");
+            // KEY difference from GetOHLCFromContract: MergeBackAdjusted
+            // means NT will request missing data from the provider
+            // (Continuum). DoNotMerge would only read what's already cached.
+            request.MergePolicy = MergePolicy.MergeBackAdjusted;
+
+            var wait = new System.Threading.ManualResetEvent(false);
+            request.Request((req, err, msg) =>
+            {
+                if (err == ErrorCode.NoError && req.Bars != null)
+                    count = req.Bars.Count;
+                wait.Set();
+            });
+            // 5-min hard cap per chunk; cancel checked between chunks
+            wait.WaitOne(TimeSpan.FromMinutes(5));
+            return count;
+        }
+
+        /// <summary>
+        /// historical.download_status(download_id) -> full job state
+        /// </summary>
+        private object HandleDownloadStatusRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string id = ReadString(payload, "download_id", required: true);
+            if (!_activeDownloads.TryGetValue(id, out var job))
+                return new Dictionary<string, object> { ["ok"] = false, ["error"] = $"unknown download_id: {id}" };
+            return JobToDict(job);
+        }
+
+        /// <summary>
+        /// historical.download_cancel(download_id) -> {ok, message}
+        /// Cancels the job. Current chunk continues to completion (~max 5 min).
+        /// </summary>
+        private object HandleDownloadCancelRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string id = ReadString(payload, "download_id", required: true);
+            if (!_activeDownloads.TryGetValue(id, out var job))
+                return new Dictionary<string, object> { ["ok"] = false, ["error"] = $"unknown download_id: {id}" };
+            if (job.Status != "running")
+                return new Dictionary<string, object>
+                {
+                    ["ok"] = true,
+                    ["download_id"] = id,
+                    ["message"] = $"Job already in terminal state: {job.Status}",
+                };
+            job.Cts.Cancel();
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["download_id"] = id,
+                ["message"] = "Cancellation requested. Current chunk completes first (up to 5 min); then job marks cancelled.",
+            };
+        }
+
+        /// <summary>
+        /// historical.list_downloads() -> {jobs: [...]}
+        /// All active + recent jobs (in-memory; lost on NT restart).
+        /// </summary>
+        private object HandleListDownloadsRpc(object payloadObj)
+        {
+            var jobs = new List<object>();
+            foreach (var kv in _activeDownloads)
+            {
+                jobs.Add(JobToDict(kv.Value));
+            }
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["count"] = jobs.Count,
+                ["jobs"] = jobs,
+            };
+        }
+
+        private static object JobToDict(DownloadJob job)
+        {
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["download_id"] = job.Id,
+                ["instrument"] = job.Instrument,
+                ["period_type"] = job.PeriodType,
+                ["period_value"] = job.PeriodValue,
+                ["market_data_type"] = job.MarketDataType,
+                ["from_iso"] = job.From.ToString("o"),
+                ["to_iso"] = job.To.ToString("o"),
+                ["status"] = job.Status,
+                ["chunks_done"] = job.ChunksDone,
+                ["chunks_total"] = job.ChunksTotal,
+                ["bars_downloaded"] = job.BarsDownloaded,
+                ["current_chunk_from"] = job.CurrentChunkFrom?.ToString("o"),
+                ["current_chunk_to"] = job.CurrentChunkTo?.ToString("o"),
+                ["elapsed_sec"] = Math.Round(job.ElapsedSec, 1),
+                ["eta_sec"] = job.EtaSec.HasValue ? (object)Math.Round(job.EtaSec.Value, 1) : null,
+                ["started_at_iso"] = job.StartedAt.ToString("o"),
+                ["finished_at_iso"] = job.FinishedAt?.ToString("o"),
+                ["error"] = job.Error,
+            };
         }
 
         // This is the correct way to add menu items in NinjaTrader 8
@@ -955,7 +1259,11 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
-        private List<OHLCBar> GetOHLCFromContract(Instrument instrument, BarsPeriodType periodType, int period,
+        // Promoted to internal static so the ExportOHLCAddOn's RPC handlers
+        // (historical.fetch_bars, historical.check_inventory) can call the
+        // same battle-tested local-cache BarsRequest path that the menu UI uses.
+        // No instance state used — only NT static APIs (Instrument, BarsRequest).
+        internal static List<OHLCBar> GetOHLCFromContract(Instrument instrument, BarsPeriodType periodType, int period,
             MarketDataType mdType, DateTime startDate, DateTime endDate, out string diagnosticMsg)
         {
             var bars = new List<OHLCBar>();
@@ -1107,7 +1415,9 @@ namespace NinjaTrader.NinjaScript.AddOns
             });
         }
 
-        private class OHLCBar
+        // Made internal (was private) so AddOn-side RPC handlers can iterate
+        // results from the now-static GetOHLCFromContract.
+        internal class OHLCBar
         {
             public DateTime Time;
             public double Open, High, Low, Close, Volume;
