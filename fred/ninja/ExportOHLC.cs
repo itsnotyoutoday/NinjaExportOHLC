@@ -108,6 +108,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.download_status",   HandleDownloadStatusRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.download_cancel",   HandleDownloadCancelRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_downloads",    HandleListDownloadsRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.probe_availability", HandleProbeAvailabilityRpc));
                     // P2P file-transfer trio (handlers live in ExportOHLCTransfer.cs)
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.prepare_transfer", HandlePrepareTransferRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.cancel_transfer",  HandleCancelTransferRpc));
@@ -531,6 +532,170 @@ namespace NinjaTrader.NinjaScript.AddOns
                 ["chunk_size_days"] = chunkDays,
                 ["estimated_time_sec"] = chunks.Count * secPerChunk,
                 ["message"] = "Download started. Poll historical.download_status with this id, or cancel with historical.download_cancel.",
+            };
+        }
+
+        // ===================================================================
+        // historical.probe_availability
+        // ===================================================================
+        //
+        // Fast discovery: "how far back can I pull data for this instrument
+        // at each granularity, before the provider gives me nothing?"
+        //
+        // Strategy: per-granularity, do a small (1-day) BarsRequest at
+        // exponentially-increasing lookback dates (1d, 1wk, 1mo, 3mo, 6mo,
+        // 1yr, 2yr, 5yr, 10yr ago). Each probe returns either bars or 0.
+        // The boundary tells the client which granularities are usable for
+        // which time depths -- without doing a single big speculative
+        // download. ~10 probes per period_type × 3 period_types = ~30s.
+        //
+        // Uses MergeBackAdjusted so we actually trigger Continuum lookups,
+        // not just cache reads. (cache-only probes would give a misleading
+        // picture -- cache state != provider availability.)
+        //
+        // RPC input:
+        //   instrument        : "MNQ 06-26" (required)
+        //   market_data_type  : "Last" (default)
+        //   period_types      : ["Day","Minute","Tick"] (default - all three)
+        //
+        // RPC output:
+        //   { ok, instrument, probes: [
+        //       {period_type, period_value, granularity,
+        //        probes_run, first_available_iso, last_available_iso,
+        //        results: [{date_iso, bars, err_code, err_message, elapsed_sec}, ...]},
+        //       ...
+        //   ]}
+
+        private object HandleProbeAvailabilityRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string instrumentFullName = ReadString(payload, "instrument", required: true);
+            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "Last";
+            // Optional: ["Day","Minute","Tick"] subset. Default = all three.
+            // For dense symbols (MNQ-class), call this once per granularity to
+            // stay under PRISM's cross-client RPC forwarding timeout.
+            var periodTypesParam = payload.TryGetValue("period_types", out var ptv) ? ptv : null;
+
+            var inst = Instrument.GetInstrument(instrumentFullName);
+            if (inst == null) throw new ArgumentException($"Instrument not found: {instrumentFullName}");
+
+            MarketDataType mdType = ParseMarketDataType(mdTypeStr);
+
+            // Build granularity list. Filter to requested subset if given.
+            var allGrans = new List<(string label, BarsPeriodType pt, int pv)>
+            {
+                ("Day1",     BarsPeriodType.Day,    1),
+                ("Minute1",  BarsPeriodType.Minute, 1),
+                ("Tick1",    BarsPeriodType.Tick,   1),
+            };
+            var granularities = new List<(string label, BarsPeriodType pt, int pv)>();
+            if (periodTypesParam is System.Collections.IEnumerable ptList && !(periodTypesParam is string))
+            {
+                var requested = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var x in ptList) requested.Add(x?.ToString() ?? "");
+                foreach (var g in allGrans)
+                    if (requested.Contains(g.pt.ToString()) || requested.Contains(g.label))
+                        granularities.Add(g);
+                if (granularities.Count == 0)
+                    throw new ArgumentException($"period_types must contain at least one of Day/Minute/Tick, got: [{string.Join(",", requested)}]");
+            }
+            else
+            {
+                granularities = allGrans;
+            }
+
+            // Lookback ladder for Day/Minute: full range up to 10yr.
+            // Tick: skip 5yr+ since provider retention is empirically ~1yr.
+            var fullLookbacks = new List<(string label, TimeSpan ago)>
+            {
+                ("1d",   TimeSpan.FromDays(1)),
+                ("1wk",  TimeSpan.FromDays(7)),
+                ("1mo",  TimeSpan.FromDays(30)),
+                ("3mo",  TimeSpan.FromDays(90)),
+                ("6mo",  TimeSpan.FromDays(180)),
+                ("1yr",  TimeSpan.FromDays(365)),
+                ("2yr",  TimeSpan.FromDays(365 * 2)),
+                ("5yr",  TimeSpan.FromDays(365 * 5)),
+                ("10yr", TimeSpan.FromDays(365 * 10)),
+            };
+            // Trim list at lookup time per granularity (see foreach below).
+            var lookbacks = fullLookbacks;
+
+            var granResults = new List<object>();
+            foreach (var g in granularities)
+            {
+                var results = new List<object>();
+                DateTime? firstAvail = null;
+                DateTime? lastAvail = null;
+                int probesRun = 0;
+
+                // Per-granularity lookback selection: Tick's max retention is
+                // empirically ~1yr on Continuum (per M2K probe finding); skip
+                // probes beyond 2yr for Tick to keep total probe time bounded.
+                var perGranLookbacks = (g.pt == BarsPeriodType.Tick)
+                    ? lookbacks.Where(lb => lb.ago <= TimeSpan.FromDays(365 * 2)).ToList()
+                    : lookbacks;
+
+                foreach (var lb in perGranLookbacks)
+                {
+                    // Tick: 4-hour window (still tons of data on liquid contracts,
+                    //   but caps total fetch under the probe timeout for MNQ-class
+                    //   density: 8.8M ticks/3day x 9 probes was blowing 120s budget).
+                    // Day/Minute: 1-day window (small, fast).
+                    TimeSpan probeWindow = (g.pt == BarsPeriodType.Tick)
+                        ? TimeSpan.FromHours(4)
+                        : TimeSpan.FromDays(1);
+                    var probeEnd = DateTime.UtcNow - lb.ago;
+                    var probeStart = probeEnd - probeWindow;
+                    probesRun++;
+
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var res = DownloadChunk(inst, g.pt, g.pv, mdType, probeStart, probeEnd);
+                    sw.Stop();
+
+                    results.Add(new Dictionary<string, object>
+                    {
+                        ["lookback"]     = lb.label,
+                        ["date_iso"]     = probeStart.ToString("o"),
+                        ["bars"]         = res.BarsCount,
+                        ["err_code"]     = res.ErrorCode,
+                        ["err_message"]  = res.ErrorMessage,
+                        ["elapsed_sec"]  = Math.Round(sw.Elapsed.TotalSeconds, 1),
+                        ["first_bar_iso"]= res.FirstBarTs?.ToUniversalTime().ToString("o"),
+                        ["last_bar_iso"] = res.LastBarTs?.ToUniversalTime().ToString("o"),
+                    });
+
+                    if (res.BarsCount > 0)
+                    {
+                        if (!firstAvail.HasValue || res.FirstBarTs < firstAvail) firstAvail = res.FirstBarTs;
+                        if (!lastAvail.HasValue  || res.LastBarTs  > lastAvail)  lastAvail  = res.LastBarTs;
+                    }
+                }
+
+                granResults.Add(new Dictionary<string, object>
+                {
+                    ["granularity"]          = g.label,
+                    ["period_type"]          = g.pt.ToString(),
+                    ["period_value"]         = g.pv,
+                    ["probes_run"]           = probesRun,
+                    ["first_available_iso"]  = firstAvail?.ToUniversalTime().ToString("o"),
+                    ["last_available_iso"]   = lastAvail?.ToUniversalTime().ToString("o"),
+                    ["results"]              = results,
+                });
+            }
+
+            return new Dictionary<string, object>
+            {
+                ["ok"]              = true,
+                ["instrument"]      = inst.FullName,
+                ["market_data_type"]= mdTypeStr,
+                ["probed_at_iso"]   = DateTime.UtcNow.ToString("o"),
+                ["probes"]          = granResults,
+                ["summary"]         = $"Probed {granularities.Count} granularities x {lookbacks.Count} lookbacks. "
+                                    + "Tick probes use 4hr window; Day/Minute use 1-day window. MergeBackAdjusted so represents provider availability not cache. "
+                                    + "CAVEAT: probes are per-CONTRACT. For symbols where data layout splits across contracts (e.g. expired back-month contracts have no trades), "
+                                    + "use historical.list_instruments + per-contract probe for the right time window. "
+                                    + "0 bars at deep lookbacks for an active contract may just mean 'contract didn't trade then', not 'provider has no data'.",
             };
         }
 
