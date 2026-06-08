@@ -410,8 +410,22 @@ namespace NinjaTrader.NinjaScript.AddOns
             public volatile int BarsDownloaded;
             public DateTime? CurrentChunkFrom;
             public DateTime? CurrentChunkTo;
-            public string Status = "running"; // running | complete | failed | cancelled
+            public string Status = "running"; // running | complete | failed | cancelled | stopped_no_data
             public string Error;
+            // Diagnostic state from the most recent BarsRequest callback so
+            // download_status can show WHY a chunk came back empty (e.g.
+            // 'HistoricalDataNotAvailable' from provider). Without this we
+            // can't distinguish "no trades happened" from "provider has no
+            // data for this range" -- both look like 0 bars.
+            public string LastChunkErrorCode;     // e.g. "NoError", "HistoricalDataNotAvailable"
+            public string LastChunkErrorMessage;  // provider-supplied message if any
+            public int    LastChunkBars;          // last chunk's bar count
+            public int    ConsecutiveEmptyChunks; // how many in a row returned 0 bars
+            // Set when auto-stop kicked in. Helpful for clients to know the
+            // boundary where data dried up.
+            public DateTime? FirstDataAt;         // earliest ts seen in any non-empty chunk so far
+            public DateTime? LastDataAt;          // latest ts seen
+            public int MaxEmptyChunks = 3;        // auto-stop threshold; overridable from RPC payload
 
             public int ChunksTotal => Chunks?.Count ?? 0;
             public double ElapsedSec => ((FinishedAt ?? DateTime.UtcNow) - StartedAt).TotalSeconds;
@@ -467,6 +481,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             string fromIso = ReadString(payload, "from_iso", required: true);
             string toIso = ReadString(payload, "to_iso", required: true);
             string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "Last";
+            int maxEmptyChunks = ReadInt(payload, "max_empty_chunks", defaultValue: 3);
 
             var inst = Instrument.GetInstrument(instrumentName);
             if (inst == null) throw new ArgumentException($"Instrument not found: {instrumentName}");
@@ -493,6 +508,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Chunks = chunks,
                 Cts = new System.Threading.CancellationTokenSource(),
                 StartedAt = DateTime.UtcNow,
+                MaxEmptyChunks = Math.Max(1, maxEmptyChunks),
             };
             _activeDownloads[id] = job;
 
@@ -519,6 +535,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // Runs in a background Task. Walks chunks, updating job state.
+        //
+        // Auto-stop logic: if MaxEmptyChunks consecutive chunks return 0 bars
+        // (and NT didn't error out), we treat that as "provider has no data
+        // in this direction" and stop early with status="stopped_no_data".
+        // The boundary in FirstDataAt/LastDataAt tells the client what we
+        // DID find. Without this, asking for 20 years of M2K (which the
+        // provider doesn't have) would still iterate all chunks at 0 bars each.
         private void RunDownloadJob(DownloadJob job, Instrument inst, BarsPeriodType periodType, MarketDataType mdType)
         {
             try
@@ -535,9 +558,37 @@ namespace NinjaTrader.NinjaScript.AddOns
                     job.CurrentChunkFrom = cFrom;
                     job.CurrentChunkTo = cTo;
 
-                    int chunkBars = DownloadChunk(inst, periodType, job.PeriodValue, mdType, cFrom, cTo);
-                    job.BarsDownloaded += chunkBars;
+                    var res = DownloadChunk(inst, periodType, job.PeriodValue, mdType, cFrom, cTo);
+                    job.LastChunkErrorCode = res.ErrorCode;
+                    job.LastChunkErrorMessage = res.ErrorMessage;
+                    job.LastChunkBars = res.BarsCount;
+                    job.BarsDownloaded += res.BarsCount;
                     job.ChunksDone++;
+
+                    if (res.BarsCount > 0)
+                    {
+                        job.ConsecutiveEmptyChunks = 0;
+                        if (!job.FirstDataAt.HasValue || res.FirstBarTs < job.FirstDataAt)
+                            job.FirstDataAt = res.FirstBarTs;
+                        if (!job.LastDataAt.HasValue || res.LastBarTs > job.LastDataAt)
+                            job.LastDataAt = res.LastBarTs;
+                    }
+                    else
+                    {
+                        job.ConsecutiveEmptyChunks++;
+                        // Auto-stop only if the empty was benign (no provider error).
+                        // If err code is benign AND we've crossed threshold, stop.
+                        // We let "interesting" error codes propagate by also stopping
+                        // (so e.g. HistoricalDataNotAvailable can short-circuit).
+                        if (job.ConsecutiveEmptyChunks >= job.MaxEmptyChunks)
+                        {
+                            job.Status = "stopped_no_data";
+                            job.Error = $"Stopped after {job.ConsecutiveEmptyChunks} consecutive empty chunks. "
+                                      + $"Last err: {job.LastChunkErrorCode}. Provider likely has no data in this range.";
+                            job.FinishedAt = DateTime.UtcNow;
+                            return;
+                        }
+                    }
                 }
                 job.Status = "complete";
                 job.FinishedAt = DateTime.UtcNow;
@@ -551,11 +602,21 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // Single chunk: BarsRequest with MergeBackAdjusted (fetches from
-        // Continuum if missing locally). Returns the bar count for progress.
-        private int DownloadChunk(Instrument inst, BarsPeriodType periodType, int periodValue,
-                                  MarketDataType mdType, DateTime fromDt, DateTime toDt)
+        // Continuum if missing locally). Returns full result so caller can
+        // distinguish "no trades happened" from "provider has no data here".
+        private struct ChunkResult
         {
-            int count = 0;
+            public int BarsCount;
+            public string ErrorCode;     // .ToString() of NT's ErrorCode enum
+            public string ErrorMessage;  // provider-supplied message (often empty)
+            public DateTime? FirstBarTs;
+            public DateTime? LastBarTs;
+        }
+
+        private ChunkResult DownloadChunk(Instrument inst, BarsPeriodType periodType, int periodValue,
+                                          MarketDataType mdType, DateTime fromDt, DateTime toDt)
+        {
+            var result = new ChunkResult { ErrorCode = "NoError" };
             var request = new BarsRequest(inst, fromDt, toDt);
             request.BarsPeriod = new BarsPeriod
             {
@@ -563,22 +624,35 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Value = periodValue,
                 MarketDataType = mdType,
             };
-            request.TradingHours = TradingHours.Get("Default 24 x 7");
-            // KEY difference from GetOHLCFromContract: MergeBackAdjusted
-            // means NT will request missing data from the provider
-            // (Continuum). DoNotMerge would only read what's already cached.
+            // CRITICAL: use the instrument's own TradingHours template, NOT
+            // "Default 24 x 7". HDM internally uses the per-instrument template
+            // (e.g. "CME US Index Futures ETH" for MNQ/M2K). The wrong template
+            // causes BarsRequest to miss the session-bucketed cache HDM
+            // populates -- silent failure: 0 bars + NoError. See research in
+            // STATUS_AND_ROADMAP.md (forum thread 1036851).
+            request.TradingHours = inst.MasterInstrument.TradingHours;
+            // MergeBackAdjusted: ask provider (Continuum) for any data
+            // we don't already have cached locally.
             request.MergePolicy = MergePolicy.MergeBackAdjusted;
 
             var wait = new System.Threading.ManualResetEvent(false);
             request.Request((req, err, msg) =>
             {
-                if (err == ErrorCode.NoError && req.Bars != null)
-                    count = req.Bars.Count;
+                // Capture every signal the callback gives us -- without this we
+                // can't tell "provider has no data for this range" (silent fail
+                // mode we observed with M2K) from "trading was halted that day".
+                result.ErrorCode = err.ToString();
+                result.ErrorMessage = msg;
+                if (err == ErrorCode.NoError && req.Bars != null && req.Bars.Count > 0)
+                {
+                    result.BarsCount = req.Bars.Count;
+                    result.FirstBarTs = req.Bars.GetTime(0);
+                    result.LastBarTs  = req.Bars.GetTime(req.Bars.Count - 1);
+                }
                 wait.Set();
             });
-            // 5-min hard cap per chunk; cancel checked between chunks
             wait.WaitOne(TimeSpan.FromMinutes(5));
-            return count;
+            return result;
         }
 
         /// <summary>
@@ -661,6 +735,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 ["started_at_iso"] = job.StartedAt.ToString("o"),
                 ["finished_at_iso"] = job.FinishedAt?.ToString("o"),
                 ["error"] = job.Error,
+                // Diagnostic visibility into the most recent BarsRequest callback.
+                // last_chunk_error_code='NoError' + last_chunk_bars=0 => quiet market /
+                // closed session.  last_chunk_error_code!='NoError' => actual provider
+                // issue (e.g. HistoricalDataNotAvailable on M2K).
+                ["last_chunk_error_code"] = job.LastChunkErrorCode,
+                ["last_chunk_error_message"] = job.LastChunkErrorMessage,
+                ["last_chunk_bars"] = job.LastChunkBars,
+                ["consecutive_empty_chunks"] = job.ConsecutiveEmptyChunks,
+                ["max_empty_chunks"] = job.MaxEmptyChunks,
+                ["first_data_at_iso"] = job.FirstDataAt?.ToUniversalTime().ToString("o"),
+                ["last_data_at_iso"]  = job.LastDataAt?.ToUniversalTime().ToString("o"),
             };
         }
 
@@ -1286,7 +1371,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                     Value = period,
                     MarketDataType = mdType
                 };
-                request.TradingHours = TradingHours.Get("Default 24 x 7");
+                // Per-instrument TradingHours (HDM's canonical choice) so we read
+                // from the same session-bucketed cache HDM populates. "Default 24 x 7"
+                // can silently miss CME-templated cache entries.
+                request.TradingHours = instrument.MasterInstrument.TradingHours;
 
                 // MergePolicy controls how contracts are merged and whether to fetch from provider
                 // DoNotMerge = use only local cache, do NOT request from provider
