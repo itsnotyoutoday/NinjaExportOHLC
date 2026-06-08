@@ -439,6 +439,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DownloadJob>
             _activeDownloads = new System.Collections.Concurrent.ConcurrentDictionary<string, DownloadJob>();
 
+        // CRITICAL: serializes BarsRequest calls across all active jobs.
+        // Without this, triggering N downloads launches N parallel Task.Runs
+        // each calling BarsRequest concurrently -- NT's BarsRequest pipeline
+        // is not designed for high concurrency and gets choked (UI freezes,
+        // provider connection congests, callbacks queue indefinitely). We
+        // hit this on the 126-job MNQ+MYM bulk run: NT had to be force-killed.
+        //
+        // Semaphore size = 2 is a conservative default that lets ONE BarsRequest
+        // be in-flight while NEXT one is queueing -- avoids the dead-time gap
+        // between requests but doesn't overwhelm the provider. Tunable via the
+        // historical.set_concurrency RPC if needed.
+        private static readonly System.Threading.SemaphoreSlim _barsRequestGate
+            = new System.Threading.SemaphoreSlim(2, 2);
+
         // Per-period chunk size (days) — chosen to keep each chunk's BarsRequest
         // under ~5 min wall time and bound memory per chunk.
         private static int ChunkSizeDays(BarsPeriodType periodType, int periodValue)
@@ -649,8 +663,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                     var probeStart = probeEnd - probeWindow;
                     probesRun++;
 
+                    // Acquire the BarsRequest gate so we don't compete with
+                    // active downloads. Probe is fast (1-day window) so this
+                    // is brief contention.
+                    _barsRequestGate.Wait();
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    var res = DownloadChunk(inst, g.pt, g.pv, mdType, probeStart, probeEnd);
+                    ChunkResult res;
+                    try { res = DownloadChunk(inst, g.pt, g.pv, mdType, probeStart, probeEnd); }
+                    finally { _barsRequestGate.Release(); }
                     sw.Stop();
 
                     results.Add(new Dictionary<string, object>
@@ -723,7 +743,32 @@ namespace NinjaTrader.NinjaScript.AddOns
                     job.CurrentChunkFrom = cFrom;
                     job.CurrentChunkTo = cTo;
 
-                    var res = DownloadChunk(inst, periodType, job.PeriodValue, mdType, cFrom, cTo);
+                    // ACQUIRE the shared bars-request gate before issuing the
+                    // BarsRequest. Caps concurrency across ALL active jobs so
+                    // NT doesn't get hammered by N parallel BarsRequests.
+                    // Wait honors cancellation. Released in finally below.
+                    bool acquired = false;
+                    try
+                    {
+                        _barsRequestGate.Wait(job.Cts.Token);
+                        acquired = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        job.Status = "cancelled";
+                        job.FinishedAt = DateTime.UtcNow;
+                        return;
+                    }
+
+                    ChunkResult res;
+                    try
+                    {
+                        res = DownloadChunk(inst, periodType, job.PeriodValue, mdType, cFrom, cTo);
+                    }
+                    finally
+                    {
+                        if (acquired) _barsRequestGate.Release();
+                    }
                     job.LastChunkErrorCode = res.ErrorCode;
                     job.LastChunkErrorMessage = res.ErrorMessage;
                     job.LastChunkBars = res.BarsCount;
