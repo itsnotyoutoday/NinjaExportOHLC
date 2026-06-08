@@ -55,7 +55,7 @@ namespace NinjaTrader.NinjaScript.AddOns
     /// Version: 1.7
     /// Last Updated: 2025-01-23
     /// </summary>
-    public class ExportOHLCAddOn : AddOnBase
+    public partial class ExportOHLCAddOn : AddOnBase
     {
         private NTMenuItem menuItem;
         private NTMenuItem existingMenu;
@@ -108,8 +108,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.download_status",   HandleDownloadStatusRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.download_cancel",   HandleDownloadCancelRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_downloads",    HandleListDownloadsRpc));
+                    // P2P file-transfer trio (handlers live in ExportOHLCTransfer.cs)
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.prepare_transfer", HandlePrepareTransferRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.cancel_transfer",  HandleCancelTransferRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_transfers",   HandleListTransfersRpc));
                     // AddOnBase.Log(message, LogLevel) -- NinjaScript base class signature requires LogLevel.
-                    Log("[plexus] Registered historical.* RPCs (list_instruments, check_inventory, fetch_bars, list_periods, download, download_status, download_cancel, list_downloads).", LogLevel.Information);
+                    Log("[plexus] Registered historical.* RPCs (list_instruments, check_inventory, fetch_bars, list_periods, download/status/cancel/list_downloads, prepare_transfer/cancel_transfer/list_transfers).", LogLevel.Information);
                 });
             }
             catch (Exception ex)
