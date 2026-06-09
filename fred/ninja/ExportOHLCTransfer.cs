@@ -76,6 +76,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             public int Port;
             public byte[] Token;               // 32 random bytes
             public int BarCount;
+            public Dictionary<string, int> BarCountByStream;
 
             public TcpListener Listener;
             public CancellationTokenSource Cts;
@@ -91,15 +92,42 @@ namespace NinjaTrader.NinjaScript.AddOns
                 StartedAt.HasValue ? ((FinishedAt ?? DateTime.UtcNow) - StartedAt.Value).TotalSeconds : (double?)null;
         }
 
+        // Simple holder class — replaced C# value-tuple generic param
+        // List<(string priceType, List<OHLCBar> bars)> because NT8's
+        // compiler intermittently produced corrupt assemblies when value
+        // tuples appeared as generic type arguments (2026-06-07 incident).
+        private class StreamBars
+        {
+            public string PriceType;
+            public List<ExportOHLCWindow.OHLCBar> Bars;
+        }
+
         // Static so transfers survive AddOn instance churn within the process,
         // same pattern as _activeDownloads above.
         private static readonly ConcurrentDictionary<string, TransferJob>
             _activeTransfers = new ConcurrentDictionary<string, TransferJob>();
 
-        // Idle timeout from prepare → first connection. After this, the temp
-        // file and listener are torn down. Generous: 5 minutes covers slow
-        // clients + network round-trips.
-        private static readonly TimeSpan TransferIdleTimeout = TimeSpan.FromMinutes(5);
+        // ONLY ONE materialization at a time. The OHLC export GUI works by
+        // serializing all heavy work (read cache -> write file -> compress)
+        // sequentially. Parallel materializations bog NT down: cache reads
+        // contend, temp dir balloons with orphan files, gzip CPU spikes,
+        // .NET thread pool exhausts. Gate everything heavy through this.
+        //
+        // RPC handlers still return instantly (they just register the job).
+        // Background task waits on this gate before doing any actual work.
+        private static readonly System.Threading.SemaphoreSlim _materializeGate
+            = new System.Threading.SemaphoreSlim(1, 1);
+
+        // Max wall-clock from prepare RPC to "ready" status. Includes time
+        // waiting in the materialize gate behind other transfers. Generous
+        // because deep tick payloads (months of MNQ × 3 streams) take many
+        // minutes to materialize + compress. Server-side guardrail; clients
+        // can have shorter timeouts.
+        private static readonly TimeSpan PrepareMaxWait = TimeSpan.FromMinutes(60);
+
+        // Idle timeout AFTER the file is "ready" and listener is open, waiting
+        // for the client to connect. 10 min is plenty for normal connect+stream.
+        private static readonly TimeSpan ReadyIdleTimeout = TimeSpan.FromMinutes(10);
 
         // Where prepared files live. Cleaned up after each transfer finishes.
         // Per-AddOn directory so multiple NT installs on one box don't collide.
@@ -130,6 +158,19 @@ namespace NinjaTrader.NinjaScript.AddOns
         //   port, token_hex, size_bytes, sha256, format, bar_count,
         //   expires_at_iso, message
 
+        // ASYNC: returns transfer_id IMMEDIATELY with status="preparing". The
+        // heavy work (3 BarsRequests + write file + gzip + sha256 + bind
+        // listener) runs in a background Task. Client polls
+        // historical.get_transfer_ticket(id) until status="ready" to get the
+        // port/token/size/sha256 ticket, then connects via TCP as before.
+        //
+        // Why: synchronous prepare for tick payloads (millions of bars × 3
+        // streams) takes 30-90s. PRISM's RPC forwarding timeout is ~10s, so
+        // the RPC call appears to fail from the client side while the dispatcher
+        // thread is still blocked — exhausts bus thread pool, NT looks frozen.
+        // Async pattern (same as historical.download) returns the dispatcher
+        // thread immediately and uses background Task.Run for materialization.
+
         private object HandlePrepareTransferRpc(object payloadObj)
         {
             var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
@@ -138,7 +179,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             int periodValue = ReadInt(payload, "period_value", defaultValue: 1);
             string fromIso = ReadString(payload, "from_iso", required: true);
             string toIso = ReadString(payload, "to_iso", required: true);
-            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "Last";
+            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "all";
             string format = (ReadString(payload, "format", required: false) ?? "csv").ToLowerInvariant();
 
             if (format != "csv" && format != "duckdb" && format != "parquet")
@@ -149,20 +190,14 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (toDt <= fromDt) throw new ArgumentException("to_iso must be > from_iso");
 
             BarsPeriodType periodType = ParsePeriodType(periodTypeStr);
-            MarketDataType mdType = ParseMarketDataType(mdTypeStr);
 
             var inst = Instrument.GetInstrument(instrumentFullName);
             if (inst == null) throw new ArgumentException($"Instrument not found: {instrumentFullName}");
 
-            // 1. Query bars (LOCAL CACHE ONLY -- caller should have ensured
-            //    coverage via historical.download first if needed)
-            var bars = ExportOHLCWindow.GetOHLCFromContract(inst, periodType, periodValue, mdType, fromDt, toDt, out string diag);
-            if (bars.Count == 0)
-                throw new InvalidOperationException(
-                    $"No bars in cache for {inst.FullName} {periodTypeStr}{periodValue} {fromIso}..{toIso}. " +
-                    "Use historical.download to fetch from provider first.");
+            // Validate streams param fast (synchronous, cheap)
+            var streams = ResolveStreams(mdTypeStr);
 
-            // 2. Prepare ID + paths
+            // Allocate IDs + paths + register the job with status="preparing"
             string id = Guid.NewGuid().ToString("N").Substring(0, 12);
             string safeSymbol = SafeFileName(inst.FullName);
             string baseName = $"{id}_{safeSymbol}_{periodTypeStr}{periodValue}_{fromDt:yyyyMMdd}-{toDt:yyyyMMdd}";
@@ -170,46 +205,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             string rawPath = Path.Combine(TransferTempRoot, $"{baseName}.{ext}");
             string gzPath = rawPath + ".gz";
 
-            // 3. Materialize the format-specific file
-            try
-            {
-                switch (format)
-                {
-                    case "csv":     WriteTransferCsv(bars, rawPath); break;
-                    case "duckdb":  WriteTransferDuckDb(inst.FullName, periodTypeStr, mdTypeStr, bars, rawPath); break;
-                    case "parquet": WriteTransferParquet(inst.FullName, periodTypeStr, mdTypeStr, bars, rawPath); break;
-                }
-            }
-            catch
-            {
-                SafeDelete(rawPath); SafeDelete(gzPath);
-                throw;
-            }
-
-            // 4. Gzip-compress to wire-ready file
-            try
-            {
-                GzipFile(rawPath, gzPath);
-            }
-            finally
-            {
-                // Raw file no longer needed once compressed copy exists
-                SafeDelete(rawPath);
-            }
-
-            // 5. Compute SHA256 of the on-wire payload (gzipped file)
-            string sha256 = Sha256Hex(gzPath);
-            long sizeBytes = new FileInfo(gzPath).Length;
-
-            // 6. Generate token + bind listener
-            byte[] token = new byte[32];
-            using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(token);
-
-            var listener = new TcpListener(IPAddress.Any, 0); // port=0 → OS picks free
-            listener.Start();
-            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-
-            // 7. Register job
             var now = DateTime.UtcNow;
             var job = new TransferJob
             {
@@ -222,51 +217,227 @@ namespace NinjaTrader.NinjaScript.AddOns
                 From = fromDt,
                 To = toDt,
                 TempPath = gzPath,
-                SizeBytes = sizeBytes,
-                Sha256Hex = sha256,
-                Port = port,
-                Token = token,
-                BarCount = bars.Count,
-                Listener = listener,
                 Cts = new CancellationTokenSource(),
                 PreparedAt = now,
-                ExpiresAt = now + TransferIdleTimeout,
+                ExpiresAt = now + PrepareMaxWait,  // hard ceiling on prepare phase
+                Status = "preparing",
             };
             _activeTransfers[id] = job;
 
-            // 8. Accept-loop on a background task (single connection then close)
-            Task.Run(() => RunTransferListener(job));
+            // Cleanup orphan temp files from prior runs (>1hr old) once per
+            // prepare. Cheap (just stat/delete a few files).
+            try { CleanupOrphanTempFiles(); } catch { }
 
-            // 9. Idle timeout watchdog
+            // Background materialization. Sets job.Status -> "ready" or "failed"
+            // when complete. The RPC returns IMMEDIATELY below.
+            Task.Run(() => PrepareTransferAsync(job, inst, periodType, periodValue,
+                                                  fromDt, toDt, streams, format, rawPath, gzPath));
+
+            // Watchdog: expire prepares that exceed the hard ceiling.
+            // (Does NOT expire 'preparing' jobs prematurely — the inner task
+            // is doing real work. Only kicks in if something deadlocks.)
             Task.Run(async () =>
             {
-                await Task.Delay(TransferIdleTimeout);
-                if (job.Status == "ready") ExpireTransfer(job);
+                await Task.Delay(PrepareMaxWait);
+                if (job.Status == "preparing") ExpireTransfer(job);
+            });
+            // Separate watchdog for the ready-but-idle case: once status flips
+            // to 'ready', if no client connects within ReadyIdleTimeout, expire.
+            Task.Run(async () =>
+            {
+                while (job.Status == "preparing" && DateTime.UtcNow < now + PrepareMaxWait)
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                if (job.Status == "ready")
+                {
+                    var readyAt = DateTime.UtcNow;
+                    while (job.Status == "ready" && DateTime.UtcNow - readyAt < ReadyIdleTimeout)
+                        await Task.Delay(TimeSpan.FromSeconds(2));
+                    if (job.Status == "ready") ExpireTransfer(job);
+                }
             });
 
+            // Return the partial ticket — port/token/size/sha256/bar_count
+            // fill in once status flips to "ready". Client polls
+            // historical.get_transfer_ticket(id) to get the complete ticket.
             return new Dictionary<string, object>
             {
                 ["ok"] = true,
                 ["transfer_id"] = id,
-                ["host"] = "",                   // client substitutes the bus host
-                ["port"] = port,
-                ["token_hex"] = HexEncode(token),
-                ["size_bytes"] = sizeBytes,
-                ["sha256"] = sha256,
-                ["format"] = format,
-                ["bar_count"] = bars.Count,
+                ["status"] = "preparing",
                 ["instrument"] = inst.FullName,
                 ["period_type"] = periodTypeStr,
                 ["period_value"] = periodValue,
                 ["market_data_type"] = mdTypeStr,
                 ["from_iso"] = fromDt.ToString("o"),
                 ["to_iso"] = toDt.ToString("o"),
+                ["format"] = format,
                 ["prepared_at_iso"] = now.ToString("o"),
                 ["expires_at_iso"] = job.ExpiresAt.ToString("o"),
-                ["message"] = $"Connect to bus_host:{port} within {TransferIdleTimeout.TotalMinutes:F0} min, "
-                            + "send 32-byte token + 8-byte LE resume_offset, then read length-prefixed chunks "
-                            + "(uint32 LE length, terminated by length=0). After download, verify SHA256, then gunzip.",
+                ["message"] = "Materialization started. Poll historical.get_transfer_ticket "
+                            + "until status='ready', then connect to (bus_host, port) with the returned token.",
             };
+        }
+
+        // Runs in a background Task. Does the heavy work that used to be
+        // synchronous in the RPC handler. Flips job.Status to "ready" with
+        // populated port/token/size/sha256 when done, or "failed" with
+        // job.Error explaining why.
+        private void PrepareTransferAsync(TransferJob job, Instrument inst,
+            BarsPeriodType periodType, int periodValue, DateTime fromDt, DateTime toDt,
+            List<Tuple<string, MarketDataType>> streams, string format,
+            string rawPath, string gzPath)
+        {
+            // SINGLE-FILE-AT-A-TIME gate. All concurrent preps queue here.
+            // While waiting, job.Status remains "preparing" — that's fine, the
+            // client polls patiently. Honors cancellation if user calls
+            // historical.cancel_transfer.
+            bool gateAcquired = false;
+            try
+            {
+                _materializeGate.Wait(job.Cts.Token);
+                gateAcquired = true;
+            }
+            catch (OperationCanceledException)
+            {
+                job.Status = "cancelled";
+                job.FinishedAt = DateTime.UtcNow;
+                return;
+            }
+
+            try
+            {
+                // 1. Query bars per stream (LOCAL CACHE ONLY)
+                var allBars = new List<StreamBars>();
+                int totalBars = 0;
+                foreach (var s in streams)
+                {
+                    var b = ExportOHLCWindow.GetOHLCFromContract(inst, periodType, periodValue, s.Item2, fromDt, toDt, out string _);
+                    allBars.Add(new StreamBars { PriceType = s.Item1, Bars = b });
+                    totalBars += b.Count;
+                }
+                if (totalBars == 0)
+                {
+                    job.Status = "no_data";
+                    job.Error = $"No bars in cache for {inst.FullName} {job.PeriodType}{job.PeriodValue} "
+                              + $"{job.From:yyyy-MM-dd}..{job.To:yyyy-MM-dd}";
+                    job.FinishedAt = DateTime.UtcNow;
+                    return;
+                }
+                job.BarCount = totalBars;
+                job.BarCountByStream = allBars.ToDictionary(t => t.PriceType, t => t.Bars.Count);
+
+                // 2. Materialize the format-specific file
+                switch (format)
+                {
+                    case "csv":     WriteTransferCsv(inst.FullName, allBars, rawPath); break;
+                    case "duckdb":  WriteTransferDuckDb(inst.FullName, allBars, rawPath); break;
+                    case "parquet": WriteTransferParquet(inst.FullName, allBars, rawPath); break;
+                }
+
+                // 3. Gzip
+                try { GzipFile(rawPath, gzPath); }
+                finally { SafeDelete(rawPath); }
+
+                // 4. SHA256 + size
+                job.Sha256Hex = Sha256Hex(gzPath);
+                job.SizeBytes = new FileInfo(gzPath).Length;
+
+                // 5. Token + listener
+                var token = new byte[32];
+                using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(token);
+                job.Token = token;
+                var listener = new TcpListener(IPAddress.Any, 0);
+                listener.Start();
+                job.Listener = listener;
+                job.Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+                // 6. Mark ready + start accept loop
+                // CRITICAL: reset ExpiresAt now that the listener is opening.
+                // The original ExpiresAt was prepare_start + PrepareMaxWait,
+                // which can be hours in the past if the materialize gate held
+                // us up. The listener's wall-clock budget should start from
+                // "ready" — 10 min for the client to connect.
+                job.ExpiresAt = DateTime.UtcNow + ReadyIdleTimeout;
+                job.Status = "ready";
+                Task.Run(() => RunTransferListener(job));
+            }
+            catch (Exception ex)
+            {
+                job.Status = "failed";
+                job.Error = ex.Message;
+                job.FinishedAt = DateTime.UtcNow;
+                SafeDelete(rawPath);
+                SafeDelete(gzPath);
+            }
+            finally
+            {
+                if (gateAcquired) _materializeGate.Release();
+            }
+        }
+
+        // Sweep orphan files in TransferTempRoot older than 1 hour. Cheap
+        // defensive cleanup so abandoned prepares (PRISM disconnect, NT crash,
+        // client gave up) don't fill disk over time. Called on every prepare.
+        private static void CleanupOrphanTempFiles()
+        {
+            var cutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
+            string dir = TransferTempRoot;
+            if (!Directory.Exists(dir)) return;
+            foreach (var path in Directory.EnumerateFiles(dir))
+            {
+                try
+                {
+                    var fi = new FileInfo(path);
+                    if (fi.LastWriteTimeUtc < cutoff) fi.Delete();
+                }
+                catch { /* best-effort */ }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // RPC: historical.get_transfer_ticket (poll for async prepare result)
+        // -------------------------------------------------------------------
+        //
+        // Returns the same shape as the old prepare_transfer once status="ready".
+        // Until then returns {status: "preparing", ...} so client knows to wait.
+
+        private object HandleGetTransferTicketRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string id = ReadString(payload, "transfer_id", required: true);
+            if (!_activeTransfers.TryGetValue(id, out var job))
+                throw new KeyNotFoundException($"transfer_id not found: {id}");
+
+            var resp = new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["transfer_id"] = job.Id,
+                ["status"] = job.Status,
+                ["instrument"] = job.Instrument,
+                ["period_type"] = job.PeriodType,
+                ["period_value"] = job.PeriodValue,
+                ["market_data_type"] = job.MarketDataType,
+                ["from_iso"] = job.From.ToString("o"),
+                ["to_iso"] = job.To.ToString("o"),
+                ["format"] = job.Format,
+                ["prepared_at_iso"] = job.PreparedAt.ToString("o"),
+                ["expires_at_iso"] = job.ExpiresAt.ToString("o"),
+                ["error"] = job.Error,
+            };
+            if (job.Status == "ready" || job.Status == "streaming" ||
+                job.Status == "complete" || job.Status == "interrupted")
+            {
+                resp["host"] = "";
+                resp["port"] = job.Port;
+                resp["token_hex"] = HexEncode(job.Token);
+                resp["size_bytes"] = job.SizeBytes;
+                resp["sha256"] = job.Sha256Hex;
+                resp["bar_count"] = job.BarCount;
+                if (job.BarCountByStream != null)
+                    resp["bar_count_by_stream"] = job.BarCountByStream.ToDictionary(
+                        kv => (object)kv.Key, kv => (object)kv.Value);
+            }
+            return resp;
         }
 
         // -------------------------------------------------------------------
@@ -508,28 +679,83 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // -------------------------------------------------------------------
-        // Format writers
+        // Stream resolution
         // -------------------------------------------------------------------
+        //
+        // market_data_type is interpreted as:
+        //   "all"   -> [last, bid, ask]  (default; missing streams just contribute 0 bars)
+        //   "Last"  -> [last]
+        //   "Bid"   -> [bid]
+        //   "Ask"   -> [ask]
+        //
+        // We tag each pulled set with its lower-case price_type for the output's
+        // price_type column. This is the dimension Databento ohlcv doesn't have
+        // (their ohlcv is implicit "last") -- it's how we represent NT's natively
+        // 3-streamed model in a flat row-oriented file.
 
-        private static void WriteTransferCsv(List<ExportOHLCWindow.OHLCBar> bars, string path)
+        private static List<Tuple<string, MarketDataType>> ResolveStreams(string mdTypeStr)
+        {
+            var s = (mdTypeStr ?? "all").Trim().ToLowerInvariant();
+            switch (s)
+            {
+                case "all": return new List<Tuple<string, MarketDataType>>
+                {
+                    Tuple.Create("last", MarketDataType.Last),
+                    Tuple.Create("bid",  MarketDataType.Bid),
+                    Tuple.Create("ask",  MarketDataType.Ask),
+                };
+                case "last": return new List<Tuple<string, MarketDataType>> { Tuple.Create("last", MarketDataType.Last) };
+                case "bid":  return new List<Tuple<string, MarketDataType>> { Tuple.Create("bid",  MarketDataType.Bid)  };
+                case "ask":  return new List<Tuple<string, MarketDataType>> { Tuple.Create("ask",  MarketDataType.Ask)  };
+                default: throw new ArgumentException($"market_data_type must be all|Last|Bid|Ask, got '{mdTypeStr}'");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Format writers — unified schema, Databento-compatible
+        // -------------------------------------------------------------------
+        //
+        // All formats produce the same logical row shape:
+        //
+        //   ts_event   (TIMESTAMP UTC, nanosecond precision in CSV via int64)
+        //   symbol     (full instrument name, e.g. "MNQ 06-26")
+        //   price_type ('last' | 'bid' | 'ask')
+        //   source     ('nt')   -- provenance flag; Databento data uses 'databento'
+        //   open, high, low, close   (DOUBLE)
+        //   volume     (BIGINT)
+        //
+        // For the row primary key: (price_type, ts_event) -- same bar timestamp
+        // can exist in multiple streams. Databento ohlcv is implicit "last" only,
+        // so when joining NT+Databento corpora, filter NT to price_type='last'.
+
+        private static void WriteTransferCsv(string symbol, List<StreamBars> allBars, string path)
         {
             var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-            using (var w = new StreamWriter(path, false, Encoding.UTF8))
+            var utf8NoBom = new UTF8Encoding(false);
+            using (var w = new StreamWriter(path, false, utf8NoBom))
             {
-                w.WriteLine("unix_ms,open,high,low,close,volume");
-                foreach (var b in bars)
+                w.WriteLine("ts_event_ns,symbol,price_type,source,open,high,low,close,volume");
+                foreach (var stream in allBars)
                 {
-                    long unixMs = (long)(b.Time.ToUniversalTime() - epoch).TotalMilliseconds;
-                    w.WriteLine($"{unixMs},{b.Open},{b.High},{b.Low},{b.Close},{b.Volume}");
+                    foreach (var b in stream.Bars)
+                    {
+                        long nsSinceEpoch = (long)((b.Time.ToUniversalTime() - epoch).Ticks) * 100L;
+                        w.WriteLine($"{nsSinceEpoch},{EscapeCsv(symbol)},{stream.PriceType},nt,"
+                                    + $"{b.Open},{b.High},{b.Low},{b.Close},{b.Volume}");
+                    }
                 }
             }
         }
 
-        private static void WriteTransferDuckDb(string symbol, string periodType, string priceType,
-            List<ExportOHLCWindow.OHLCBar> bars, string path)
+        private static string EscapeCsv(string s)
         {
-            // Fresh single-table DB per transfer. Single price_type per request
-            // (avoids the multi-pass quirks of the on-disk archive DB).
+            if (s == null) return "";
+            if (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) < 0) return s;
+            return "\"" + s.Replace("\"", "\"\"") + "\"";
+        }
+
+        private static void WriteTransferDuckDb(string symbol, List<StreamBars> allBars, string path)
+        {
             DuckDBConnection cnx = null;
             try
             {
@@ -537,18 +763,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                 cnx.Open();
                 ExecuteNonQueryStatic(cnx, @"
                     CREATE TABLE bars (
+                        ts_event    TIMESTAMP NOT NULL,
                         symbol      VARCHAR NOT NULL,
                         price_type  VARCHAR NOT NULL,
-                        unix_ms     BIGINT NOT NULL,
-                        timestamp   TIMESTAMP NOT NULL,
+                        source      VARCHAR NOT NULL DEFAULT 'nt',
                         open        DOUBLE NOT NULL,
                         high        DOUBLE NOT NULL,
                         low         DOUBLE NOT NULL,
                         close       DOUBLE NOT NULL,
                         volume      BIGINT NOT NULL,
-                        PRIMARY KEY (unix_ms)
+                        PRIMARY KEY (price_type, ts_event)
                     )");
-                InsertBarsStatic(cnx, "bars", symbol, priceType.ToLowerInvariant(), bars);
+                foreach (var stream in allBars)
+                    InsertBarsStatic(cnx, "bars", symbol, stream.PriceType, stream.Bars);
             }
             finally
             {
@@ -556,22 +783,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
-        private static void WriteTransferParquet(string symbol, string periodType, string priceType,
-            List<ExportOHLCWindow.OHLCBar> bars, string path)
+        private static void WriteTransferParquet(string symbol, List<StreamBars> allBars, string path)
         {
-            // No Parquet.Net NuGet -- pipe through DuckDB COPY TO. The intermediate
-            // .db file lives next to the output briefly then is deleted.
+            // No Parquet.Net NuGet -- pipe through DuckDB COPY TO.
             string tmpDb = path + ".tmpdb";
             try
             {
-                WriteTransferDuckDb(symbol, periodType, priceType, bars, tmpDb);
+                WriteTransferDuckDb(symbol, allBars, tmpDb);
                 DuckDBConnection cnx = null;
                 try
                 {
                     cnx = new DuckDBConnection($"Data Source={tmpDb}");
                     cnx.Open();
-                    // DuckDB writes to the path verbatim, overwriting if exists.
-                    var sql = $"COPY (SELECT * FROM bars ORDER BY unix_ms) TO '{path.Replace("'", "''")}' (FORMAT PARQUET, COMPRESSION SNAPPY)";
+                    // ORDER BY (price_type, ts_event) so consumers can stream-read
+                    // grouped by stream without an extra sort pass.
+                    var sql = $"COPY (SELECT ts_event, symbol, price_type, source, open, high, low, close, volume "
+                            + $"FROM bars ORDER BY price_type, ts_event) "
+                            + $"TO '{path.Replace("'", "''")}' (FORMAT PARQUET, COMPRESSION SNAPPY)";
                     ExecuteNonQueryStatic(cnx, sql);
                 }
                 finally
@@ -598,20 +826,23 @@ namespace NinjaTrader.NinjaScript.AddOns
             string symbol, string priceType, List<ExportOHLCWindow.OHLCBar> bars)
         {
             if (bars.Count == 0) return;
-            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
             int chunkSize = 1000;
+            // Escape symbol for SQL literal (handles "MNQ 06-26" -- space is fine,
+            // but defensively quote anything that has special chars). Single-quote
+            // escape via doubling.
+            string sym = symbol.Replace("'", "''");
             for (int i = 0; i < bars.Count; i += chunkSize)
             {
                 int n = Math.Min(chunkSize, bars.Count - i);
                 var sb = new StringBuilder();
-                sb.Append($"INSERT OR REPLACE INTO {tableName} (symbol, price_type, unix_ms, timestamp, open, high, low, close, volume) VALUES ");
+                sb.Append($"INSERT OR REPLACE INTO {tableName} (ts_event, symbol, price_type, source, open, high, low, close, volume) VALUES ");
                 for (int j = 0; j < n; j++)
                 {
                     var b = bars[i + j];
-                    long unixMs = (long)(b.Time.ToUniversalTime() - epoch).TotalMilliseconds;
-                    string ts = b.Time.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.fff");
+                    // DuckDB TIMESTAMP literal: 'YYYY-MM-DD HH:MM:SS.ffffff' (microseconds)
+                    string ts = b.Time.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.ffffff");
                     if (j > 0) sb.Append(",");
-                    sb.Append($"('{symbol}','{priceType}',{unixMs},'{ts}',{b.Open},{b.High},{b.Low},{b.Close},{b.Volume})");
+                    sb.Append($"(TIMESTAMP '{ts}','{sym}','{priceType}','nt',{b.Open},{b.High},{b.Low},{b.Close},{b.Volume})");
                 }
                 ExecuteNonQueryStatic(cnx, sb.ToString());
             }
