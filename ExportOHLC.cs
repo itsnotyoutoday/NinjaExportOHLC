@@ -50,8 +50,8 @@ namespace NinjaTrader.NinjaScript.AddOns
     /// Note: Bid/Ask data availability depends on your data provider.
     /// Some providers only supply Last (trade) data.
     ///
-    /// Version: 1.9.2
-    /// Last Updated: 2026-06-09
+    /// Version: 1.10.0
+    /// Last Updated: 2026-06-10
     /// </summary>
     public partial class ExportOHLCAddOn : AddOnBase
     {
@@ -738,6 +738,35 @@ namespace NinjaTrader.NinjaScript.AddOns
                     ExecuteNonQuery(conn, $"DELETE FROM export_progress WHERE symbol = '{symbolRoot}' AND table_name = '{tableName}'");
                 }
 
+                // Clean up orphan staging tables from prior crashed/killed runs.
+                // Each contract creates _stage_<tableName>_<guid>. When NT is
+                // hard-killed mid-run those don't get dropped, and they
+                // accumulate in the DB file across runs.
+                try
+                {
+                    var orphans = new List<string>();
+                    using (var cmd = conn.CreateCommand())
+                    {
+                        cmd.CommandText = "SELECT table_name FROM duckdb_tables()";
+                        using (var rdr = cmd.ExecuteReader())
+                        {
+                            string prefix = $"_stage_{tableName}_";
+                            while (rdr.Read())
+                            {
+                                string tn = rdr.GetString(0);
+                                if (tn != null && tn.StartsWith(prefix)) orphans.Add(tn);
+                            }
+                        }
+                    }
+                    foreach (var t in orphans)
+                    {
+                        try { ExecuteNonQuery(conn, $"DROP TABLE IF EXISTS {t}"); } catch { }
+                    }
+                    if (orphans.Count > 0)
+                        Log($"  Dropped {orphans.Count} orphan staging table(s) from prior runs");
+                }
+                catch { /* DB might not have duckdb_tables() in very old versions */ }
+
                 DateTime requestedFromDate = startDate.Date;
                 DateTime requestedToDate   = endDate.Date;
 
@@ -1162,41 +1191,46 @@ namespace NinjaTrader.NinjaScript.AddOns
             return totalStaged;
         }
 
-        // Bulk insert into the no-PK staging table — no ON CONFLICT, no PK
-        // index lookups. Much faster than the keyed insert path for high-row
-        // datasets (tick). Bigger chunk size (5000) reduces SQL-parse overhead.
+        // Bulk insert into the no-PK staging table using DuckDB's native
+        // binary Appender API instead of string-built INSERT statements.
+        //
+        // Why: the prior multi-row INSERT approach measured ~300 bars/sec for
+        // tick data (1M-bar chunks took 60+ minutes to stage). The Appender
+        // pushes binary values directly through DuckDB's C API, skipping the
+        // SQL parser, type-coercer, and per-statement transaction flush.
+        // Realistic speedup: 100×+ — tick chunks should now finish in seconds.
+        //
+        // Column order MUST match the staging table schema exactly:
+        //   symbol, price_type, unix_ms, timestamp, open, high, low, close, volume
         private int InsertBarsToStaging(DuckDBConnection connection, string stagingTable, string symbol, string priceType, List<OHLCBar> bars)
         {
             if (bars.Count == 0) return 0;
 
-            int chunkSize = 5000;
-            int processed = 0;
             var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-            for (int i = 0; i < bars.Count; i += chunkSize)
+            using (var appender = connection.CreateAppender(stagingTable))
             {
-                int end = Math.Min(i + chunkSize, bars.Count);
-                var sb = new StringBuilder(chunkSize * 90);
-                sb.Append($"INSERT INTO {stagingTable} (symbol, price_type, unix_ms, timestamp, open, high, low, close, volume) VALUES ");
-
-                for (int j = i; j < end; j++)
+                foreach (var bar in bars)
                 {
-                    var bar = bars[j];
-                    long unixMs = (long)(bar.Time.ToUniversalTime() - epoch).TotalMilliseconds;
-                    string timestamp = bar.Time.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.fff");
+                    DateTime ts = bar.Time.ToUniversalTime();
+                    long unixMs = (long)(ts - epoch).TotalMilliseconds;
+                    long volume = (long)bar.Volume; // staging schema = BIGINT
 
-                    if (j > i) sb.Append(',');
-                    sb.Append('(').Append('\'').Append(symbol).Append("','").Append(priceType).Append("',")
-                      .Append(unixMs).Append(",'").Append(timestamp).Append("',")
-                      .Append(bar.Open).Append(',').Append(bar.High).Append(',')
-                      .Append(bar.Low).Append(',').Append(bar.Close).Append(',')
-                      .Append(bar.Volume).Append(')');
+                    appender.CreateRow()
+                        .AppendValue(symbol)
+                        .AppendValue(priceType)
+                        .AppendValue(unixMs)
+                        .AppendValue(ts)
+                        .AppendValue(bar.Open)
+                        .AppendValue(bar.High)
+                        .AppendValue(bar.Low)
+                        .AppendValue(bar.Close)
+                        .AppendValue(volume)
+                        .EndRow();
                 }
-
-                ExecuteNonQuery(connection, sb.ToString());
-                processed += (end - i);
+                appender.Close(); // explicit flush; using also disposes
             }
-            return processed;
+            return bars.Count;
         }
 
         // Resume-after-crash check. Returns true if a prior export run

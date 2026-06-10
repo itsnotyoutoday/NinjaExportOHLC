@@ -1,7 +1,7 @@
 # ExportOHLC
 
-**Version: 1.9.2**
-**Last Updated: 2026-06-09**
+**Version: 1.10.0**
+**Last Updated: 2026-06-10**
 
 A NinjaTrader 8 AddOn that exports historical futures data (Tick / 1-Minute / Day OHLCV) from the local NT cache across **all contract months** of a symbol, stitched into a continuous series with **front-month-wins** dedup at roll boundaries.
 
@@ -168,6 +168,7 @@ To force a full refetch: check **"Replace existing data"** before clicking EXPOR
 
 ## Version history
 
+- **1.10.0** — Staging inserts now use DuckDB's binary `Appender` API (100×+ faster on tick data — chunks that took 60+ minutes via SQL INSERT now finish in seconds); auto-drop orphan staging tables from prior crashed runs
 - **1.9.2** — Schema migration ALTER without `NOT NULL` constraint (DuckDB limitation)
 - **1.9.1** — Added `contract` column for audit trail; CSV/Parquet/DuckDB all expose it
 - **1.9.0** — `export_progress` table for resumability; per-contract atomic merge; selectable status log; DatePicker dark theme; `yyyy-MM-dd` dates
