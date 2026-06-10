@@ -1,18 +1,18 @@
 #region Using declarations
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Media;
+using System.Threading.Tasks;
 using NinjaTrader.Cbi;
-using NinjaTrader.Core;
 using NinjaTrader.Data;
-using NinjaTrader.Gui;
-using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 using DuckDB.NET.Data;
 // Plexus bus integration — uses IPlexusService.RegisterMethod (v0.7+) to expose
@@ -23,73 +23,40 @@ using Plexus;
 namespace NinjaTrader.NinjaScript.AddOns
 {
     /// <summary>
-    /// Exports OHLC history by scanning ALL contract months
-    /// and merging them into continuous data.
+    /// OPTIONAL Plexus-bus partial of ExportOHLCAddOn.
     ///
-    /// Features:
-    ///   - LOCAL DATA ONLY - never triggers downloads from data provider
-    ///   - Optional date range (From/To) - filters output to specified range
-    ///   - Supports Minute, Tick, and Day timeframes
-    ///   - Export to CSV and/or DuckDB database
-    ///   - DuckDB: Merge mode (default) adds data without deleting existing
-    ///   - DuckDB: Replace mode option to delete and re-export all data
-    ///   - "Check Existing DB Data" button to see what's already in database
-    ///   - Use Historical Data Manager to download data before exporting
+    /// Adds these RPCs to the Plexus bus:
+    ///   historical.list_instruments  /  list_periods  /  check_inventory
+    ///   historical.fetch_bars        /  probe_availability
+    ///   historical.download          /  download_status / download_cancel
+    ///                                /  list_downloads
+    ///   historical.prepare_transfer  /  cancel_transfer / list_transfers
+    ///                                /  get_transfer_ticket
     ///
-    /// CSV Output: Up to 3 files with Unix timestamps (milliseconds)
-    ///   - {Symbol}_Last_OHLC_{timestamp}.csv (trade prices)
-    ///   - {Symbol}_Bid_OHLC_{timestamp}.csv (bid prices, if available)
-    ///   - {Symbol}_Ask_OHLC_{timestamp}.csv (ask prices, if available)
-    ///
-    /// DuckDB Output: Single database with 3 tables
-    ///   - ticks: tick data with bid/ask/last
-    ///   - minutes: minute data with bid/ask/last
-    ///   - days: daily data with bid/ask/last
-    ///
-    /// DuckDB Setup: Place DuckDB.NET.Data.dll, DuckDB.NET.Bindings.dll,
-    /// and duckdb.dll (native x64) in NinjaTrader's bin folder.
-    ///
-    /// Note: Bid/Ask data availability depends on your data provider.
-    /// Some providers only supply Last (trade) data.
-    ///
-    /// Version: 1.7
-    /// Last Updated: 2025-01-23
+    /// To ship ExportOHLC WITHOUT Plexus:
+    ///   - Delete this file.
+    ///   - The base ExportOHLC.cs continues to compile and run; its
+    ///     partial void TryRegisterPlexusRpcs / DisposePlexusRpcs hooks
+    ///     become no-ops (C# language feature: empty partial method
+    ///     declarations vanish at compile time if no implementation exists).
     /// </summary>
-    public partial class ExportOHLCAddOn : AddOnBase
+    public partial class ExportOHLCAddOn
     {
-        private NTMenuItem menuItem;
-        private NTMenuItem existingMenu;
-
         // Plexus bus RPC registration tokens. Filled on State.Active when
         // PlexusAddOn is available; disposed on State.Terminated.
         // We try registration but never fail the AddOn if PlexusAddOn is
         // not deployed — the menu-driven export still works standalone.
         private readonly List<IDisposable> _plexusRpcTokens = new List<IDisposable>();
 
-        protected override void OnStateChange()
+        // Dispose Plexus RPC registration tokens at AddOn teardown.
+        // Called from the base file's OnStateChange when State==Terminated.
+        partial void DisposePlexusRpcs()
         {
-            if (State == State.SetDefaults)
-            {
-                Description = "Export ALL OHLC history from all contracts; exposes historical.* over Plexus bus";
-                Name = "ExportOHLC";
-            }
-            else if (State == State.Active)
-            {
-                // Register the historical.* RPCs on the bus. If PlexusAddOn
-                // isn't loaded, RegisterMethod returns a no-op disposable —
-                // safe to ignore. AddOn-load order doesn't matter because
-                // PlexusServiceImpl queues registrations and re-applies on
-                // every CreateBusClient/RestartBus.
-                TryRegisterPlexusRpcs();
-            }
-            else if (State == State.Terminated)
-            {
-                foreach (var t in _plexusRpcTokens) { try { t.Dispose(); } catch { } }
-                _plexusRpcTokens.Clear();
-            }
+            foreach (var t in _plexusRpcTokens) { try { t.Dispose(); } catch { } }
+            _plexusRpcTokens.Clear();
         }
 
-        private void TryRegisterPlexusRpcs()
+        partial void TryRegisterPlexusRpcs()
         {
             try
             {
@@ -113,6 +80,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.prepare_transfer", HandlePrepareTransferRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.cancel_transfer",  HandleCancelTransferRpc));
                     _plexusRpcTokens.Add(svc.RegisterMethod("historical.list_transfers",   HandleListTransfersRpc));
+                    _plexusRpcTokens.Add(svc.RegisterMethod("historical.get_transfer_ticket", HandleGetTransferTicketRpc));
                     // AddOnBase.Log(message, LogLevel) -- NinjaScript base class signature requires LogLevel.
                     Log("[plexus] Registered historical.* RPCs (list_instruments, check_inventory, fetch_bars, list_periods, download/status/cancel/list_downloads, prepare_transfer/cancel_transfer/list_transfers).", LogLevel.Information);
                 });
@@ -959,908 +927,894 @@ namespace NinjaTrader.NinjaScript.AddOns
             };
         }
 
-        // This is the correct way to add menu items in NinjaTrader 8
-        protected override void OnWindowCreated(Window window)
+        // ============================================================
+        // P2P file-transfer RPCs (formerly ExportOHLCTransfer.cs)
+        // ============================================================
+
+        // -------------------------------------------------------------------
+        // Job state
+        // -------------------------------------------------------------------
+
+        private class TransferJob
         {
-            // Only add to the Control Center window (check by type name)
-            if (window.GetType().Name != "ControlCenter")
-                return;
+            public string Id;
+            public string Format;              // csv | duckdb | parquet
+            public string Instrument;
+            public string PeriodType;
+            public int PeriodValue;
+            public string MarketDataType;
+            public DateTime From;
+            public DateTime To;
 
-            // Find the "New" menu using FindFirst extension method
-            existingMenu = window.FindFirst("ControlCenterMenuItemNew") as NTMenuItem;
-            if (existingMenu == null)
+            public string TempPath;            // the gzipped output we serve from
+            public long SizeBytes;             // size of TempPath
+            public string Sha256Hex;           // hex sha256 of TempPath
+            public int Port;
+            public byte[] Token;               // 32 random bytes
+            public int BarCount;
+            public Dictionary<string, int> BarCountByStream;
+
+            public TcpListener Listener;
+            public CancellationTokenSource Cts;
+            public DateTime PreparedAt;
+            public DateTime ExpiresAt;
+            public DateTime? StartedAt;        // first byte sent
+            public DateTime? FinishedAt;
+            public long BytesSent;             // running counter
+            public string Status = "ready";    // ready | streaming | complete | cancelled | expired | failed
+            public string Error;
+
+            public double? ElapsedSec =>
+                StartedAt.HasValue ? ((FinishedAt ?? DateTime.UtcNow) - StartedAt.Value).TotalSeconds : (double?)null;
+        }
+
+        // Simple holder class — replaced C# value-tuple generic param
+        // List<(string priceType, List<OHLCBar> bars)> because NT8's
+        // compiler intermittently produced corrupt assemblies when value
+        // tuples appeared as generic type arguments (2026-06-07 incident).
+        private class StreamBars
+        {
+            public string PriceType;
+            public List<ExportOHLCWindow.OHLCBar> Bars;
+        }
+
+        // Static so transfers survive AddOn instance churn within the process,
+        // same pattern as _activeDownloads above.
+        private static readonly ConcurrentDictionary<string, TransferJob>
+            _activeTransfers = new ConcurrentDictionary<string, TransferJob>();
+
+        // ONLY ONE materialization at a time. The OHLC export GUI works by
+        // serializing all heavy work (read cache -> write file -> compress)
+        // sequentially. Parallel materializations bog NT down: cache reads
+        // contend, temp dir balloons with orphan files, gzip CPU spikes,
+        // .NET thread pool exhausts. Gate everything heavy through this.
+        //
+        // RPC handlers still return instantly (they just register the job).
+        // Background task waits on this gate before doing any actual work.
+        private static readonly System.Threading.SemaphoreSlim _materializeGate
+            = new System.Threading.SemaphoreSlim(1, 1);
+
+        // Max wall-clock from prepare RPC to "ready" status. Includes time
+        // waiting in the materialize gate behind other transfers. Generous
+        // because deep tick payloads (months of MNQ × 3 streams) take many
+        // minutes to materialize + compress. Server-side guardrail; clients
+        // can have shorter timeouts.
+        private static readonly TimeSpan PrepareMaxWait = TimeSpan.FromMinutes(60);
+
+        // Idle timeout AFTER the file is "ready" and listener is open, waiting
+        // for the client to connect. 10 min is plenty for normal connect+stream.
+        private static readonly TimeSpan ReadyIdleTimeout = TimeSpan.FromMinutes(10);
+
+        // Where prepared files live. Cleaned up after each transfer finishes.
+        // Per-AddOn directory so multiple NT installs on one box don't collide.
+        private static string TransferTempRoot
+        {
+            get
             {
-                // Try Tools menu as fallback
-                existingMenu = window.FindFirst("ControlCenterMenuItemTools") as NTMenuItem;
+                var p = Path.Combine(Path.GetTempPath(), "PlexusTransfers");
+                Directory.CreateDirectory(p);
+                return p;
             }
+        }
 
-            if (existingMenu == null)
-                return;
+        // -------------------------------------------------------------------
+        // RPC: historical.prepare_transfer
+        // -------------------------------------------------------------------
+        //
+        // Input:
+        //   instrument        : "MNQ 06-26"  (full contract name)
+        //   period_type       : "Minute" | "Tick" | "Second" | "Day"
+        //   period_value      : int (default 1)
+        //   from_iso, to_iso  : ISO-8601 timestamps
+        //   market_data_type  : "Last" | "Bid" | "Ask"  (default "Last")
+        //   format            : "csv" | "duckdb" | "parquet"
+        //
+        // Output (the "ticket" the client uses to connect):
+        //   ok, transfer_id, host (empty -- client substitutes bus host),
+        //   port, token_hex, size_bytes, sha256, format, bar_count,
+        //   expires_at_iso, message
 
-            // Create our menu item
-            menuItem = new NTMenuItem
+        // ASYNC: returns transfer_id IMMEDIATELY with status="preparing". The
+        // heavy work (3 BarsRequests + write file + gzip + sha256 + bind
+        // listener) runs in a background Task. Client polls
+        // historical.get_transfer_ticket(id) until status="ready" to get the
+        // port/token/size/sha256 ticket, then connects via TCP as before.
+        //
+        // Why: synchronous prepare for tick payloads (millions of bars × 3
+        // streams) takes 30-90s. PRISM's RPC forwarding timeout is ~10s, so
+        // the RPC call appears to fail from the client side while the dispatcher
+        // thread is still blocked — exhausts bus thread pool, NT looks frozen.
+        // Async pattern (same as historical.download) returns the dispatcher
+        // thread immediately and uses background Task.Run for materialization.
+
+        private object HandlePrepareTransferRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string instrumentFullName = ReadString(payload, "instrument", required: true);
+            string periodTypeStr = ReadString(payload, "period_type", required: true);
+            int periodValue = ReadInt(payload, "period_value", defaultValue: 1);
+            string fromIso = ReadString(payload, "from_iso", required: true);
+            string toIso = ReadString(payload, "to_iso", required: true);
+            string mdTypeStr = ReadString(payload, "market_data_type", required: false) ?? "all";
+            string format = (ReadString(payload, "format", required: false) ?? "csv").ToLowerInvariant();
+
+            if (format != "csv" && format != "duckdb" && format != "parquet")
+                throw new ArgumentException($"format must be csv|duckdb|parquet, got '{format}'");
+
+            DateTime fromDt = DateTime.Parse(fromIso).ToUniversalTime();
+            DateTime toDt = DateTime.Parse(toIso).ToUniversalTime();
+            if (toDt <= fromDt) throw new ArgumentException("to_iso must be > from_iso");
+
+            BarsPeriodType periodType = ParsePeriodType(periodTypeStr);
+
+            var inst = Instrument.GetInstrument(instrumentFullName);
+            if (inst == null) throw new ArgumentException($"Instrument not found: {instrumentFullName}");
+
+            // Validate streams param fast (synchronous, cheap)
+            var streams = ResolveStreams(mdTypeStr);
+
+            // Allocate IDs + paths + register the job with status="preparing"
+            string id = Guid.NewGuid().ToString("N").Substring(0, 12);
+            string safeSymbol = SafeFileName(inst.FullName);
+            string baseName = $"{id}_{safeSymbol}_{periodTypeStr}{periodValue}_{fromDt:yyyyMMdd}-{toDt:yyyyMMdd}";
+            string ext = FormatExtension(format);
+            string rawPath = Path.Combine(TransferTempRoot, $"{baseName}.{ext}");
+            string gzPath = rawPath + ".gz";
+
+            var now = DateTime.UtcNow;
+            var job = new TransferJob
             {
-                Header = "Export OHLC History (All Contracts)",
-                Style = Application.Current.TryFindResource("MainMenuItem") as Style
+                Id = id,
+                Format = format,
+                Instrument = inst.FullName,
+                PeriodType = periodTypeStr,
+                PeriodValue = periodValue,
+                MarketDataType = mdTypeStr,
+                From = fromDt,
+                To = toDt,
+                TempPath = gzPath,
+                Cts = new CancellationTokenSource(),
+                PreparedAt = now,
+                ExpiresAt = now + PrepareMaxWait,  // hard ceiling on prepare phase
+                Status = "preparing",
             };
-            menuItem.Click += OnMenuClick;
+            _activeTransfers[id] = job;
 
-            // Add to the menu
-            existingMenu.Items.Add(menuItem);
-        }
+            // Cleanup orphan temp files from prior runs (>1hr old) once per
+            // prepare. Cheap (just stat/delete a few files).
+            try { CleanupOrphanTempFiles(); } catch { }
 
-        protected override void OnWindowDestroyed(Window window)
-        {
-            if (menuItem != null && window.GetType().Name == "ControlCenter")
+            // Background materialization. Sets job.Status -> "ready" or "failed"
+            // when complete. The RPC returns IMMEDIATELY below.
+            Task.Run(() => PrepareTransferAsync(job, inst, periodType, periodValue,
+                                                  fromDt, toDt, streams, format, rawPath, gzPath));
+
+            // Watchdog: expire prepares that exceed the hard ceiling.
+            // (Does NOT expire 'preparing' jobs prematurely — the inner task
+            // is doing real work. Only kicks in if something deadlocks.)
+            Task.Run(async () =>
             {
-                if (existingMenu != null && existingMenu.Items.Contains(menuItem))
-                    existingMenu.Items.Remove(menuItem);
-            }
-        }
-
-        private void OnMenuClick(object sender, RoutedEventArgs e)
-        {
-            Core.Globals.RandomDispatcher.BeginInvoke(new Action(() => new ExportOHLCWindow().Show()));
-        }
-    }
-
-    public class ExportOHLCWindow : NTWindow
-    {
-        private TextBox symbolBox;
-        private CheckBox tickCheck;
-        private CheckBox minuteCheck;
-        private CheckBox dayCheck;
-        private TextBox fromDateBox;
-        private TextBox toDateBox;
-        private CheckBox exportCsvCheck;
-        private CheckBox exportDuckDbCheck;
-        private CheckBox replaceExistingDataCheck;
-        private TextBox outputBox;
-        private Button exportBtn;
-        private Button checkDbBtn;
-        private TextBlock statusBlock;
-        private ScrollViewer statusScroll;
-        private ProgressBar progressBar;
-        private bool running;
-
-        public ExportOHLCWindow()
-        {
-            Title = "Export OHLC - All Contracts";
-            Width = 480;
-            Height = 580;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-
-            var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            var stack = new StackPanel { Margin = new Thickness(15) };
-
-            // Title
-            stack.Children.Add(new TextBlock
+                await Task.Delay(PrepareMaxWait);
+                if (job.Status == "preparing") ExpireTransfer(job);
+            });
+            // Separate watchdog for the ready-but-idle case: once status flips
+            // to 'ready', if no client connects within ReadyIdleTimeout, expire.
+            Task.Run(async () =>
             {
-                Text = "Export OHLC History",
-                FontSize = 16,
-                FontWeight = FontWeights.Bold,
-                Margin = new Thickness(0, 0, 0, 10)
+                while (job.Status == "preparing" && DateTime.UtcNow < now + PrepareMaxWait)
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                if (job.Status == "ready")
+                {
+                    var readyAt = DateTime.UtcNow;
+                    while (job.Status == "ready" && DateTime.UtcNow - readyAt < ReadyIdleTimeout)
+                        await Task.Delay(TimeSpan.FromSeconds(2));
+                    if (job.Status == "ready") ExpireTransfer(job);
+                }
             });
 
-            // Symbol input
-            stack.Children.Add(new TextBlock { Text = "Symbol Root:", FontWeight = FontWeights.SemiBold });
-            symbolBox = new TextBox { Text = "MYM", Margin = new Thickness(0, 3, 0, 10), Padding = new Thickness(6), FontSize = 13 };
-            stack.Children.Add(symbolBox);
-
-            // Data Types (checkboxes)
-            stack.Children.Add(new TextBlock { Text = "Data Types:", FontWeight = FontWeights.SemiBold });
-            var dataStack = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 5, 0, 10) };
-            tickCheck = new CheckBox { Content = "Tick", IsChecked = false, Margin = new Thickness(0, 0, 20, 0), Foreground = Brushes.LightGray };
-            minuteCheck = new CheckBox { Content = "1 Minute", IsChecked = true, Margin = new Thickness(0, 0, 20, 0), Foreground = Brushes.LightGray };
-            dayCheck = new CheckBox { Content = "Day", IsChecked = false, Foreground = Brushes.LightGray };
-            dataStack.Children.Add(tickCheck);
-            dataStack.Children.Add(minuteCheck);
-            dataStack.Children.Add(dayCheck);
-            stack.Children.Add(dataStack);
-
-            // Date Range
-            stack.Children.Add(new TextBlock { Text = "Date Range (optional, blank = all local data):", FontWeight = FontWeights.SemiBold });
-            var dateStack = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 5, 0, 10) };
-            dateStack.Children.Add(new TextBlock { Text = "From:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) });
-            fromDateBox = new TextBox { Width = 90, Padding = new Thickness(4), Text = "", Margin = new Thickness(0, 0, 15, 0) };
-            dateStack.Children.Add(fromDateBox);
-            dateStack.Children.Add(new TextBlock { Text = "To:", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) });
-            toDateBox = new TextBox { Width = 90, Padding = new Thickness(4), Text = "" };
-            dateStack.Children.Add(toDateBox);
-            stack.Children.Add(dateStack);
-            stack.Children.Add(new TextBlock { Text = "Format: YYYY-MM-DD (e.g. 2024-01-15)", Foreground = Brushes.Gray, FontSize = 9, Margin = new Thickness(0, 0, 0, 10) });
-
-            // Info text about data source
-            stack.Children.Add(new TextBlock
+            // Return the partial ticket — port/token/size/sha256/bar_count
+            // fill in once status flips to "ready". Client polls
+            // historical.get_transfer_ticket(id) to get the complete ticket.
+            return new Dictionary<string, object>
             {
-                Text = "Note: Only exports data already in NinjaTrader's local cache.\nUse Historical Data Manager to download data first.",
-                Foreground = Brushes.Gray,
-                FontSize = 10,
-                Margin = new Thickness(0, 0, 0, 10),
-                TextWrapping = TextWrapping.Wrap
-            });
-
-            // Export Format
-            stack.Children.Add(new TextBlock { Text = "Export Format:", FontWeight = FontWeights.SemiBold });
-            var formatStack = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 5, 0, 5) };
-            exportCsvCheck = new CheckBox { Content = "CSV", IsChecked = true, Margin = new Thickness(0, 0, 20, 0), Foreground = Brushes.LightGray };
-            formatStack.Children.Add(exportCsvCheck);
-            exportDuckDbCheck = new CheckBox { Content = "DuckDB", IsChecked = false, Foreground = Brushes.LightGray };
-            formatStack.Children.Add(exportDuckDbCheck);
-            stack.Children.Add(formatStack);
-
-            // DuckDB options
-            replaceExistingDataCheck = new CheckBox
-            {
-                Content = "Replace existing data (default: merge/add new data)",
-                IsChecked = false,
-                Margin = new Thickness(0, 5, 0, 5),
-                Foreground = Brushes.Gray,
-                FontSize = 11
+                ["ok"] = true,
+                ["transfer_id"] = id,
+                ["status"] = "preparing",
+                ["instrument"] = inst.FullName,
+                ["period_type"] = periodTypeStr,
+                ["period_value"] = periodValue,
+                ["market_data_type"] = mdTypeStr,
+                ["from_iso"] = fromDt.ToString("o"),
+                ["to_iso"] = toDt.ToString("o"),
+                ["format"] = format,
+                ["prepared_at_iso"] = now.ToString("o"),
+                ["expires_at_iso"] = job.ExpiresAt.ToString("o"),
+                ["message"] = "Materialization started. Poll historical.get_transfer_ticket "
+                            + "until status='ready', then connect to (bus_host, port) with the returned token.",
             };
-            stack.Children.Add(replaceExistingDataCheck);
-
-            // Check DB button
-            checkDbBtn = new Button
-            {
-                Content = "Check Existing DB Data",
-                FontSize = 11,
-                Padding = new Thickness(10, 5, 10, 5),
-                Margin = new Thickness(0, 0, 0, 10),
-                HorizontalAlignment = HorizontalAlignment.Left
-            };
-            checkDbBtn.Click += OnCheckDbClick;
-            stack.Children.Add(checkDbBtn);
-
-            // Output folder
-            stack.Children.Add(new TextBlock { Text = "Output Folder:", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 10, 0, 0) });
-            outputBox = new TextBox
-            {
-                Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "NinjaTrader_OHLC"),
-                Margin = new Thickness(0, 3, 0, 15),
-                Padding = new Thickness(6)
-            };
-            stack.Children.Add(outputBox);
-
-            // Export button
-            exportBtn = new Button
-            {
-                Content = "EXPORT",
-                FontSize = 14,
-                FontWeight = FontWeights.Bold,
-                Padding = new Thickness(15, 10, 15, 10),
-                Background = new SolidColorBrush(Color.FromRgb(0, 130, 80)),
-                Foreground = Brushes.White,
-                HorizontalAlignment = HorizontalAlignment.Left
-            };
-            exportBtn.Click += OnExportClick;
-            stack.Children.Add(exportBtn);
-
-            // Progress
-            progressBar = new ProgressBar { Height = 6, Margin = new Thickness(0, 10, 0, 5), Visibility = Visibility.Collapsed };
-            stack.Children.Add(progressBar);
-
-            // Status log
-            statusScroll = new ScrollViewer
-            {
-                Height = 120,
-                Background = new SolidColorBrush(Color.FromRgb(25, 25, 30)),
-                Padding = new Thickness(8),
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto
-            };
-            statusBlock = new TextBlock
-            {
-                Text = "Ready.",
-                Foreground = Brushes.LightGreen,
-                FontFamily = new FontFamily("Consolas"),
-                FontSize = 10,
-                TextWrapping = TextWrapping.Wrap
-            };
-            statusScroll.Content = statusBlock;
-            stack.Children.Add(statusScroll);
-
-            scroll.Content = stack;
-            Content = scroll;
         }
 
-        private void OnExportClick(object sender, RoutedEventArgs e)
+        // Runs in a background Task. Does the heavy work that used to be
+        // synchronous in the RPC handler. Flips job.Status to "ready" with
+        // populated port/token/size/sha256 when done, or "failed" with
+        // job.Error explaining why.
+        private void PrepareTransferAsync(TransferJob job, Instrument inst,
+            BarsPeriodType periodType, int periodValue, DateTime fromDt, DateTime toDt,
+            List<Tuple<string, MarketDataType>> streams, string format,
+            string rawPath, string gzPath)
         {
-            if (running) return;
-
-            string symbolRoot = symbolBox.Text.Trim().ToUpper();
-            if (string.IsNullOrEmpty(symbolRoot)) { Log("Enter a symbol root", true); return; }
-
-            // Check at least one data type selected
-            bool doTick = tickCheck.IsChecked == true;
-            bool doMinute = minuteCheck.IsChecked == true;
-            bool doDay = dayCheck.IsChecked == true;
-
-            if (!doTick && !doMinute && !doDay)
-            {
-                Log("Select at least one data type (Tick, Minute, or Day)", true);
-                return;
-            }
-
-            // Parse dates
-            DateTime? fromDate = null;
-            DateTime? toDate = null;
-
-            string fromStr = fromDateBox.Text.Trim();
-            string toStr = toDateBox.Text.Trim();
-
-            if (!string.IsNullOrEmpty(fromStr))
-            {
-                if (DateTime.TryParse(fromStr, out DateTime fd))
-                    fromDate = fd;
-                else
-                {
-                    Log("Invalid From date. Use YYYY-MM-DD format.", true);
-                    return;
-                }
-            }
-
-            if (!string.IsNullOrEmpty(toStr))
-            {
-                if (DateTime.TryParse(toStr, out DateTime td))
-                    toDate = td;
-                else
-                {
-                    Log("Invalid To date. Use YYYY-MM-DD format.", true);
-                    return;
-                }
-            }
-
-            bool exportCsv = exportCsvCheck.IsChecked == true;
-            bool exportDuckDb = exportDuckDbCheck.IsChecked == true;
-            bool replaceExisting = replaceExistingDataCheck.IsChecked == true;
-
-            if (!exportCsv && !exportDuckDb)
-            {
-                Log("Select at least one export format (CSV or DuckDB)", true);
-                return;
-            }
-
-            string outDir = outputBox.Text.Trim();
-
-            running = true;
-            exportBtn.IsEnabled = false;
-            progressBar.Visibility = Visibility.Visible;
-            progressBar.IsIndeterminate = true;
-            statusBlock.Text = "";
-
-            // Run export for each selected data type
-            ThreadPool.QueueUserWorkItem(_ => RunExportAll(symbolRoot, outDir, fromDate, toDate, exportCsv, exportDuckDb, replaceExisting, doTick, doMinute, doDay));
-        }
-
-        private void OnCheckDbClick(object sender, RoutedEventArgs e)
-        {
-            string symbolRoot = symbolBox.Text.Trim().ToUpper();
-            if (string.IsNullOrEmpty(symbolRoot))
-            {
-                Log("Enter a symbol root to check", true);
-                return;
-            }
-
-            string outDir = outputBox.Text.Trim();
-            string symbolDir = Path.Combine(outDir, symbolRoot);
-            string dbPath = Path.Combine(symbolDir, $"{symbolRoot}.db");
-
-            if (!File.Exists(dbPath))
-            {
-                Log($"No database found at: {dbPath}");
-                return;
-            }
-
-            statusBlock.Text = "";
-            Log($"Checking database: {dbPath}\n");
-
-            ThreadPool.QueueUserWorkItem(_ => CheckExistingDbData(dbPath, symbolRoot));
-        }
-
-        private void CheckExistingDbData(string dbPath, string symbolRoot)
-        {
-            DuckDBConnection connection = null;
+            // SINGLE-FILE-AT-A-TIME gate. All concurrent preps queue here.
+            // While waiting, job.Status remains "preparing" — that's fine, the
+            // client polls patiently. Honors cancellation if user calls
+            // historical.cancel_transfer.
+            bool gateAcquired = false;
             try
             {
-                connection = new DuckDBConnection($"Data Source={dbPath}");
-                connection.Open();
+                _materializeGate.Wait(job.Cts.Token);
+                gateAcquired = true;
+            }
+            catch (OperationCanceledException)
+            {
+                job.Status = "cancelled";
+                job.FinishedAt = DateTime.UtcNow;
+                return;
+            }
 
-                string[] tables = { "ticks", "minutes", "days" };
-
-                foreach (var table in tables)
+            try
+            {
+                // 1. Query bars per stream (LOCAL CACHE ONLY)
+                var allBars = new List<StreamBars>();
+                int totalBars = 0;
+                foreach (var s in streams)
                 {
-                    try
-                    {
-                        var cmd = connection.CreateCommand();
-                        cmd.CommandText = $@"
-                            SELECT
-                                price_type,
-                                COUNT(*) as bar_count,
-                                MIN(timestamp) as min_date,
-                                MAX(timestamp) as max_date
-                            FROM {table}
-                            WHERE symbol = '{symbolRoot}'
-                            GROUP BY price_type
-                            ORDER BY price_type";
+                    var b = ExportOHLCWindow.GetOHLCFromContract(inst, periodType, periodValue, s.Item2, fromDt, toDt, out string _);
+                    allBars.Add(new StreamBars { PriceType = s.Item1, Bars = b });
+                    totalBars += b.Count;
+                }
+                if (totalBars == 0)
+                {
+                    job.Status = "no_data";
+                    job.Error = $"No bars in cache for {inst.FullName} {job.PeriodType}{job.PeriodValue} "
+                              + $"{job.From:yyyy-MM-dd}..{job.To:yyyy-MM-dd}";
+                    job.FinishedAt = DateTime.UtcNow;
+                    return;
+                }
+                job.BarCount = totalBars;
+                job.BarCountByStream = allBars.ToDictionary(t => t.PriceType, t => t.Bars.Count);
 
-                        using (var reader = cmd.ExecuteReader())
-                        {
-                            bool hasData = false;
-                            while (reader.Read())
-                            {
-                                if (!hasData)
-                                {
-                                    Log($"═══ {table.ToUpper()} ═══");
-                                    hasData = true;
-                                }
-                                string priceType = reader.GetString(0);
-                                long count = reader.GetInt64(1);
-                                var minDate = reader.GetDateTime(2);
-                                var maxDate = reader.GetDateTime(3);
-                                Log($"  {priceType}: {count:N0} bars ({minDate:yyyy-MM-dd} to {maxDate:yyyy-MM-dd})");
-                            }
-                            if (!hasData)
-                            {
-                                Log($"═══ {table.ToUpper()} ═══");
-                                Log($"  No data for {symbolRoot}");
-                            }
-                        }
-                        cmd.Dispose();
-                    }
-                    catch
-                    {
-                        // Table doesn't exist
-                        Log($"═══ {table.ToUpper()} ═══");
-                        Log($"  Table not found");
-                    }
+                // 2. Materialize the format-specific file
+                switch (format)
+                {
+                    case "csv":     WriteTransferCsv(inst.FullName, allBars, rawPath); break;
+                    case "duckdb":  WriteTransferDuckDb(inst.FullName, allBars, rawPath); break;
+                    case "parquet": WriteTransferParquet(inst.FullName, allBars, rawPath); break;
                 }
 
-                Log("\n✓ Database check complete");
+                // 3. Gzip
+                try { GzipFile(rawPath, gzPath); }
+                finally { SafeDelete(rawPath); }
+
+                // 4. SHA256 + size
+                job.Sha256Hex = Sha256Hex(gzPath);
+                job.SizeBytes = new FileInfo(gzPath).Length;
+
+                // 5. Token + listener
+                var token = new byte[32];
+                using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(token);
+                job.Token = token;
+                var listener = new TcpListener(IPAddress.Any, 0);
+                listener.Start();
+                job.Listener = listener;
+                job.Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+                // 6. Mark ready + start accept loop
+                // CRITICAL: reset ExpiresAt now that the listener is opening.
+                // The original ExpiresAt was prepare_start + PrepareMaxWait,
+                // which can be hours in the past if the materialize gate held
+                // us up. The listener's wall-clock budget should start from
+                // "ready" — 10 min for the client to connect.
+                job.ExpiresAt = DateTime.UtcNow + ReadyIdleTimeout;
+                job.Status = "ready";
+                Task.Run(() => RunTransferListener(job));
             }
             catch (Exception ex)
             {
-                Log($"Error checking database: {ex.Message}", true);
+                job.Status = "failed";
+                job.Error = ex.Message;
+                job.FinishedAt = DateTime.UtcNow;
+                SafeDelete(rawPath);
+                SafeDelete(gzPath);
             }
             finally
             {
-                if (connection != null)
-                {
-                    try { connection.Close(); } catch { }
-                    try { connection.Dispose(); } catch { }
-                }
+                if (gateAcquired) _materializeGate.Release();
             }
         }
 
-        private void RunExportAll(string symbolRoot, string outDir, DateTime? fromDate, DateTime? toDate,
-            bool exportCsv, bool exportDuckDb, bool replaceExisting, bool doTick, bool doMinute, bool doDay)
+        // Sweep orphan files in TransferTempRoot older than 1 hour. Cheap
+        // defensive cleanup so abandoned prepares (PRISM disconnect, NT crash,
+        // client gave up) don't fill disk over time. Called on every prepare.
+        private static void CleanupOrphanTempFiles()
         {
-            try
+            var cutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
+            string dir = TransferTempRoot;
+            if (!Directory.Exists(dir)) return;
+            foreach (var path in Directory.EnumerateFiles(dir))
             {
-                if (doTick)
+                try
                 {
-                    Log("═══ TICK DATA ═══");
-                    RunExport(symbolRoot, 1, "Tick", outDir, fromDate, toDate, exportCsv, exportDuckDb, replaceExisting);
+                    var fi = new FileInfo(path);
+                    if (fi.LastWriteTimeUtc < cutoff) fi.Delete();
                 }
-
-                if (doMinute)
-                {
-                    Log("\n═══ MINUTE DATA ═══");
-                    RunExport(symbolRoot, 1, "Minute", outDir, fromDate, toDate, exportCsv, exportDuckDb, replaceExisting);
-                }
-
-                if (doDay)
-                {
-                    Log("\n═══ DAY DATA ═══");
-                    RunExport(symbolRoot, 1, "Day", outDir, fromDate, toDate, exportCsv, exportDuckDb, replaceExisting);
-                }
-
-                Finish();
-            }
-            catch (Exception ex)
-            {
-                Log($"\nERROR: {ex.Message}", true);
-                Finish();
+                catch { /* best-effort */ }
             }
         }
 
-        private void RunExport(string symbolRoot, int period, string tfType, string outDir,
-            DateTime? fromDate, DateTime? toDate, bool exportCsv, bool exportDuckDb, bool replaceExisting)
+        // -------------------------------------------------------------------
+        // RPC: historical.get_transfer_ticket (poll for async prepare result)
+        // -------------------------------------------------------------------
+        //
+        // Returns the same shape as the old prepare_transfer once status="ready".
+        // Until then returns {status: "preparing", ...} so client knows to wait.
+
+        private object HandleGetTransferTicketRpc(object payloadObj)
         {
-            try
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string id = ReadString(payload, "transfer_id", required: true);
+            if (!_activeTransfers.TryGetValue(id, out var job))
+                throw new KeyNotFoundException($"transfer_id not found: {id}");
+
+            var resp = new Dictionary<string, object>
             {
-                // Determine date range
-                DateTime startDate, endDate;
-
-                if (fromDate.HasValue && toDate.HasValue)
-                {
-                    startDate = fromDate.Value.Date;
-                    endDate = toDate.Value.Date.AddDays(1).AddTicks(-1); // End of day
-                    Log($"Date filter: {startDate:yyyy-MM-dd HH:mm} to {endDate:yyyy-MM-dd HH:mm}");
-                }
-                else if (fromDate.HasValue)
-                {
-                    startDate = fromDate.Value.Date;
-                    endDate = DateTime.Now;
-                    Log($"Date range: {startDate:yyyy-MM-dd} to now");
-                }
-                else if (toDate.HasValue)
-                {
-                    // Only To date specified - use very old start date for local data
-                    startDate = new DateTime(1990, 1, 1);
-                    endDate = toDate.Value.Date.AddDays(1).AddTicks(-1);
-                    Log($"Date filter: earliest to {toDate.Value:yyyy-MM-dd}");
-                }
-                else
-                {
-                    // No dates specified - export all available local data
-                    startDate = new DateTime(1990, 1, 1);
-                    endDate = DateTime.Now;
-                    Log("Exporting all available local data (no date filter)");
-                }
-
-                Log($"Source: Local cache only (use Historical Data Manager to download more)");
-                Log($"\nScanning for all {symbolRoot} contracts...");
-
-                // Find all instruments matching this symbol root
-                var contracts = new List<Instrument>();
-
-                foreach (var inst in Instrument.All)
-                {
-                    if (inst.MasterInstrument != null &&
-                        inst.MasterInstrument.Name == symbolRoot &&
-                        inst.MasterInstrument.InstrumentType == InstrumentType.Future)
-                    {
-                        contracts.Add(inst);
-                    }
-                }
-
-                // Sort by expiry date
-                contracts = contracts.OrderBy(c => c.Expiry).ToList();
-
-                if (contracts.Count == 0)
-                {
-                    Log($"No contracts found for '{symbolRoot}'", true);
-                    Log("Make sure you have downloaded historical data in Historical Data Manager", true);
-                    return;
-                }
-
-                Log($"Found {contracts.Count} contracts:");
-                foreach (var c in contracts)
-                {
-                    Log($"  • {c.FullName} (expires {c.Expiry:yyyy-MM-dd})");
-                }
-
-                if (!Directory.Exists(outDir))
-                    Directory.CreateDirectory(outDir);
-
-                BarsPeriodType periodType = tfType switch
-                {
-                    "Tick" => BarsPeriodType.Tick,
-                    "Day" => BarsPeriodType.Day,
-                    _ => BarsPeriodType.Minute
-                };
-
-                // Collect ALL OHLC data from ALL contracts for each MarketDataType
-                var allLastBars = new List<OHLCBar>();
-                var allBidBars = new List<OHLCBar>();
-                var allAskBars = new List<OHLCBar>();
-
-                int contractNum = 0;
-                foreach (var contract in contracts)
-                {
-                    contractNum++;
-                    Log($"\n[{contractNum}/{contracts.Count}] Processing {contract.FullName}...");
-
-                    // Get Last OHLC
-                    var lastBars = GetOHLCFromContract(contract, periodType, period, MarketDataType.Last, startDate, endDate, out string lastDiag);
-                    if (lastBars.Count > 0)
-                    {
-                        Log($"  Last: {lastBars.Count:N0} bars" + (lastDiag != null ? $" ({lastDiag})" : ""));
-                        allLastBars.AddRange(lastBars);
-                    }
-
-                    // Get Bid OHLC
-                    var bidBars = GetOHLCFromContract(contract, periodType, period, MarketDataType.Bid, startDate, endDate, out string bidDiag);
-                    if (bidBars.Count > 0)
-                    {
-                        Log($"  Bid: {bidBars.Count:N0} bars" + (bidDiag != null ? $" ({bidDiag})" : ""));
-                        allBidBars.AddRange(bidBars);
-                    }
-
-                    // Get Ask OHLC
-                    var askBars = GetOHLCFromContract(contract, periodType, period, MarketDataType.Ask, startDate, endDate, out string askDiag);
-                    if (askBars.Count > 0)
-                    {
-                        Log($"  Ask: {askBars.Count:N0} bars" + (askDiag != null ? $" ({askDiag})" : ""));
-                        allAskBars.AddRange(askBars);
-                    }
-                }
-
-                if (allLastBars.Count == 0 && allBidBars.Count == 0 && allAskBars.Count == 0)
-                {
-                    Log("\nNo data retrieved from any contract!", true);
-                    return;
-                }
-
-                // Merge and deduplicate (sort by time, keep one bar per timestamp)
-                Log($"\nMerging bars...");
-
-                var mergedLast = MergeAndDedupe(allLastBars);
-                var mergedBid = MergeAndDedupe(allBidBars);
-                var mergedAsk = MergeAndDedupe(allAskBars);
-
-                Log($"After merge - Last: {mergedLast.Count:N0}, Bid: {mergedBid.Count:N0}, Ask: {mergedAsk.Count:N0}");
-
-                // Create symbol subdirectory
-                string symbolDir = Path.Combine(outDir, symbolRoot);
-                if (!Directory.Exists(symbolDir))
-                    Directory.CreateDirectory(symbolDir);
-
-                int filesWritten = 0;
-                string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-
-                // Export to CSV if selected
-                if (exportCsv)
-                {
-                    Log($"\n--- CSV Export ---");
-
-                    if (mergedLast.Count > 0)
-                    {
-                        string lastFile = Path.Combine(symbolDir, $"{symbolRoot}_Last_OHLC_{ts}.csv");
-                        WriteOHLCFile(lastFile, mergedLast);
-                        Log($"✓ Last: {mergedLast.Count:N0} bars → {symbolRoot}/{Path.GetFileName(lastFile)}");
-                        filesWritten++;
-                    }
-
-                    if (mergedBid.Count > 0)
-                    {
-                        string bidFile = Path.Combine(symbolDir, $"{symbolRoot}_Bid_OHLC_{ts}.csv");
-                        WriteOHLCFile(bidFile, mergedBid);
-                        Log($"✓ Bid: {mergedBid.Count:N0} bars → {symbolRoot}/{Path.GetFileName(bidFile)}");
-                        filesWritten++;
-                    }
-
-                    if (mergedAsk.Count > 0)
-                    {
-                        string askFile = Path.Combine(symbolDir, $"{symbolRoot}_Ask_OHLC_{ts}.csv");
-                        WriteOHLCFile(askFile, mergedAsk);
-                        Log($"✓ Ask: {mergedAsk.Count:N0} bars → {symbolRoot}/{Path.GetFileName(askFile)}");
-                        filesWritten++;
-                    }
-                }
-
-                // Export to DuckDB if selected
-                if (exportDuckDb)
-                {
-                    Log($"\n--- DuckDB Export ---");
-                    ExportToDuckDb(symbolRoot, tfType, outDir, mergedLast, mergedBid, mergedAsk, replaceExisting);
-                }
-
-                // Summary - use whichever has data for date range
-                var primaryBars = mergedLast.Count > 0 ? mergedLast : (mergedBid.Count > 0 ? mergedBid : mergedAsk);
-                var minDate = primaryBars.Min(b => b.Time);
-                var maxDate = primaryBars.Max(b => b.Time);
-
-                Log("\n══════════════════════════════════════════");
-                Log("EXPORT COMPLETE!");
-                Log($"Symbol: {symbolRoot}");
-                Log($"Timeframe: {period} {tfType}");
-                Log($"Contracts processed: {contracts.Count}");
-                if (exportCsv) Log($"CSV files created: {filesWritten}");
-                if (exportDuckDb) Log($"DuckDB table: {(tfType == "Tick" ? "ticks" : tfType == "Day" ? "days" : "minutes")}");
-                Log($"Date range: {minDate:yyyy-MM-dd} to {maxDate:yyyy-MM-dd}");
-                Log($"Output: {symbolDir}");
-                Log("══════════════════════════════════════════");
-            }
-            catch (Exception ex)
+                ["ok"] = true,
+                ["transfer_id"] = job.Id,
+                ["status"] = job.Status,
+                ["instrument"] = job.Instrument,
+                ["period_type"] = job.PeriodType,
+                ["period_value"] = job.PeriodValue,
+                ["market_data_type"] = job.MarketDataType,
+                ["from_iso"] = job.From.ToString("o"),
+                ["to_iso"] = job.To.ToString("o"),
+                ["format"] = job.Format,
+                ["prepared_at_iso"] = job.PreparedAt.ToString("o"),
+                ["expires_at_iso"] = job.ExpiresAt.ToString("o"),
+                ["error"] = job.Error,
+            };
+            if (job.Status == "ready" || job.Status == "streaming" ||
+                job.Status == "complete" || job.Status == "interrupted")
             {
-                Log($"\nERROR: {ex.Message}", true);
+                resp["host"] = "";
+                resp["port"] = job.Port;
+                resp["token_hex"] = HexEncode(job.Token);
+                resp["size_bytes"] = job.SizeBytes;
+                resp["sha256"] = job.Sha256Hex;
+                resp["bar_count"] = job.BarCount;
+                if (job.BarCountByStream != null)
+                    resp["bar_count_by_stream"] = job.BarCountByStream.ToDictionary(
+                        kv => (object)kv.Key, kv => (object)kv.Value);
             }
+            return resp;
         }
 
-        // Promoted to internal static so the ExportOHLCAddOn's RPC handlers
-        // (historical.fetch_bars, historical.check_inventory) can call the
-        // same battle-tested local-cache BarsRequest path that the menu UI uses.
-        // No instance state used — only NT static APIs (Instrument, BarsRequest).
-        internal static List<OHLCBar> GetOHLCFromContract(Instrument instrument, BarsPeriodType periodType, int period,
-            MarketDataType mdType, DateTime startDate, DateTime endDate, out string diagnosticMsg)
-        {
-            var bars = new List<OHLCBar>();
-            diagnosticMsg = null;
-            string capturedMsg = null;
+        // -------------------------------------------------------------------
+        // RPC: historical.cancel_transfer
+        // -------------------------------------------------------------------
 
+        private object HandleCancelTransferRpc(object payloadObj)
+        {
+            var payload = payloadObj as IDictionary<string, object> ?? new Dictionary<string, object>();
+            string id = ReadString(payload, "transfer_id", required: true);
+
+            if (!_activeTransfers.TryGetValue(id, out var job))
+                throw new KeyNotFoundException($"transfer_id not found: {id}");
+
+            try { job.Cts.Cancel(); } catch { }
+            try { job.Listener?.Stop(); } catch { }
+            job.Status = "cancelled";
+            job.FinishedAt = DateTime.UtcNow;
+            SafeDelete(job.TempPath);
+
+            return new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["transfer_id"] = id,
+                ["status"] = "cancelled",
+                ["message"] = "Transfer cancelled. Temp file deleted; listener closed.",
+            };
+        }
+
+        // -------------------------------------------------------------------
+        // RPC: historical.list_transfers
+        // -------------------------------------------------------------------
+
+        private object HandleListTransfersRpc(object payloadObj)
+        {
+            var list = new List<object>();
+            foreach (var kv in _activeTransfers)
+                list.Add(TransferJobToDict(kv.Value));
+            // Most recent first
+            list = list.OrderByDescending(d => ((Dictionary<string, object>)d)["prepared_at_iso"]).ToList();
+            return new Dictionary<string, object> { ["transfers"] = list };
+        }
+
+        private static object TransferJobToDict(TransferJob j) => new Dictionary<string, object>
+        {
+            ["transfer_id"] = j.Id,
+            ["format"] = j.Format,
+            ["instrument"] = j.Instrument,
+            ["period_type"] = j.PeriodType,
+            ["period_value"] = j.PeriodValue,
+            ["market_data_type"] = j.MarketDataType,
+            ["from_iso"] = j.From.ToString("o"),
+            ["to_iso"] = j.To.ToString("o"),
+            ["port"] = j.Port,
+            ["size_bytes"] = j.SizeBytes,
+            ["sha256"] = j.Sha256Hex,
+            ["bar_count"] = j.BarCount,
+            ["bytes_sent"] = j.BytesSent,
+            ["status"] = j.Status,
+            ["error"] = j.Error,
+            ["prepared_at_iso"] = j.PreparedAt.ToString("o"),
+            ["expires_at_iso"] = j.ExpiresAt.ToString("o"),
+            ["started_at_iso"] = j.StartedAt?.ToString("o"),
+            ["finished_at_iso"] = j.FinishedAt?.ToString("o"),
+            ["elapsed_sec"] = j.ElapsedSec,
+        };
+
+        // -------------------------------------------------------------------
+        // TCP listener: accept ONE connection, validate token, stream bytes
+        // -------------------------------------------------------------------
+        //
+        // Wire protocol (all integers little-endian):
+        //
+        //   Handshake (client -> server): 40 bytes
+        //     [0..32)  : token
+        //     [32..40) : resume_offset (uint64)
+        //
+        //   Handshake reply (server -> client): 9 bytes
+        //     [0]      : status (0=ok, 1=bad_token, 2=cancelled, 3=offset_oob, 4=error)
+        //     [1..9)   : remaining_bytes_from_offset (uint64)
+        //
+        //   Stream (server -> client): repeat until length=0
+        //     [0..4)   : chunk_length (uint32)
+        //     [4..)    : chunk_length bytes of raw gzipped file content
+        //
+        //   Terminator: chunk_length = 0 marks EOF.
+
+        private const int ChunkBytes = 64 * 1024;
+
+        // Per successful byte, bump expiry by this much so an actively-progressing
+        // client doesn't get torn down mid-transfer. Idle-only expiry still kicks
+        // in if the client stops making progress.
+        private static readonly TimeSpan ProgressExtension = TimeSpan.FromMinutes(2);
+
+        // Accept-loop: keeps the listener open until cancel/expire, allowing the
+        // client to reconnect after a network drop and resume from its byte
+        // offset. The pre-compressed temp file lives on disk until the job
+        // terminally completes/cancels/expires -- never deleted on per-connection
+        // failure, so cross-drop resume Just Works.
+        private void RunTransferListener(TransferJob job)
+        {
             try
             {
-                // IMPORTANT: BarsRequest date range constructor
-                // NinjaTrader sometimes ignores these dates and returns all cached data
-                // We MUST filter results ourselves to respect the date range
-                var request = new BarsRequest(instrument, startDate, endDate);
-                request.BarsPeriod = new BarsPeriod
+                while (!job.Cts.IsCancellationRequested && DateTime.UtcNow < job.ExpiresAt)
                 {
-                    BarsPeriodType = periodType,
-                    Value = period,
-                    MarketDataType = mdType
-                };
-                // Per-instrument TradingHours (HDM's canonical choice) so we read
-                // from the same session-bucketed cache HDM populates. "Default 24 x 7"
-                // can silently miss CME-templated cache entries.
-                request.TradingHours = instrument.MasterInstrument.TradingHours;
-
-                // MergePolicy controls how contracts are merged and whether to fetch from provider
-                // DoNotMerge = use only local cache, do NOT request from provider
-                // ALWAYS use DoNotMerge to prevent unwanted provider downloads
-                // This ensures we only export what's already in NinjaTrader's local cache
-                request.MergePolicy = MergePolicy.DoNotMerge;
-
-                var wait = new ManualResetEvent(false);
-
-                request.Request((req, err, msg) =>
-                {
-                    if (err == ErrorCode.NoError && req.Bars != null)
+                    TcpClient client;
+                    try
                     {
-                        int totalBars = req.Bars.Count;
-                        int filteredOut = 0;
-
-                        for (int i = 0; i < req.Bars.Count; i++)
+                        // Pending() lets us cooperate with the expiry watchdog
+                        // (don't block forever on Accept when we're about to expire)
+                        while (!job.Listener.Pending())
                         {
-                            var barTime = req.Bars.GetTime(i);
+                            if (job.Cts.IsCancellationRequested) return;
+                            if (DateTime.UtcNow >= job.ExpiresAt) return;
+                            Thread.Sleep(200);
+                        }
+                        client = job.Listener.AcceptTcpClient();
+                    }
+                    catch (SocketException) { return; }        // listener closed
+                    catch (ObjectDisposedException) { return; }
 
-                            // CRITICAL: Filter bars to respect the user's date range
-                            // NinjaTrader may return data outside requested range
-                            if (barTime >= startDate && barTime <= endDate)
+                    HandleOneConnection(job, client); // never throws
+                    if (job.Status == "complete") return; // happy-path exit
+                    // Else: stays in loop for resume reconnects
+                }
+            }
+            finally
+            {
+                try { job.Listener?.Stop(); } catch { }
+                // File lives on disk for any non-terminal state (e.g. "interrupted"
+                // mid-resume). Terminal states clean it up here OR in their RPC
+                // handler (cancel/expire).
+                if (job.Status == "complete" || job.Status == "cancelled" || job.Status == "expired")
+                    SafeDelete(job.TempPath);
+            }
+        }
+
+        // One connection lifecycle: handshake → stream → either complete or
+        // interrupt. Never throws -- failures flip status to "interrupted" and
+        // the outer accept-loop keeps the listener alive for the next attempt.
+        private void HandleOneConnection(TransferJob job, TcpClient client)
+        {
+            try
+            {
+                using (client)
+                using (var stream = client.GetStream())
+                {
+                    client.NoDelay = true;
+
+                    // 1. Read handshake (40 bytes)
+                    var hdr = ReadExact(stream, 40);
+                    if (hdr == null) { Interrupt(job, "client closed before handshake"); return; }
+
+                    byte[] gotToken = new byte[32];
+                    Array.Copy(hdr, 0, gotToken, 0, 32);
+                    long resumeOffset = BitConverter.ToInt64(hdr, 32);
+
+                    // 2. Validate token (constant-time)
+                    if (!ConstantTimeEq(gotToken, job.Token))
+                    {
+                        WriteHandshakeReply(stream, status: 1, remaining: 0);
+                        Interrupt(job, "bad token");
+                        return;
+                    }
+
+                    long fileSize = job.SizeBytes;
+                    if (resumeOffset < 0 || resumeOffset > fileSize)
+                    {
+                        WriteHandshakeReply(stream, status: 3, remaining: 0);
+                        Interrupt(job, $"offset {resumeOffset} out of range [0,{fileSize}]");
+                        return;
+                    }
+
+                    long remaining = fileSize - resumeOffset;
+                    WriteHandshakeReply(stream, status: 0, remaining: (ulong)remaining);
+
+                    // Mark streaming + capture the first stream start time
+                    job.Status = "streaming";
+                    if (!job.StartedAt.HasValue) job.StartedAt = DateTime.UtcNow;
+
+                    // 3. Stream from offset, length-prefixed chunks
+                    using (var fs = new FileStream(job.TempPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    {
+                        fs.Seek(resumeOffset, SeekOrigin.Begin);
+                        var buf = new byte[ChunkBytes];
+                        long connBytes = 0;
+                        DateTime lastBump = DateTime.UtcNow;
+                        while (!job.Cts.IsCancellationRequested)
+                        {
+                            int n = fs.Read(buf, 0, buf.Length);
+                            if (n <= 0) break;
+                            WriteUInt32LE(stream, (uint)n);
+                            stream.Write(buf, 0, n);
+                            job.BytesSent += n;
+                            connBytes += n;
+                            // Bump expiry on progress so big transfers don't time out mid-stream.
+                            // Throttle to once per second to avoid lock contention.
+                            if ((DateTime.UtcNow - lastBump).TotalSeconds >= 1.0)
                             {
-                                bars.Add(new OHLCBar
-                                {
-                                    Time = barTime,
-                                    Open = req.Bars.GetOpen(i),
-                                    High = req.Bars.GetHigh(i),
-                                    Low = req.Bars.GetLow(i),
-                                    Close = req.Bars.GetClose(i),
-                                    Volume = req.Bars.GetVolume(i)
-                                });
-                            }
-                            else
-                            {
-                                filteredOut++;
+                                job.ExpiresAt = DateTime.UtcNow + ProgressExtension;
+                                lastBump = DateTime.UtcNow;
                             }
                         }
 
-                        // Log if significant filtering occurred (more than 10% filtered)
-                        if (filteredOut > 0 && totalBars > 0)
+                        if (!job.Cts.IsCancellationRequested)
                         {
-                            double pctFiltered = (filteredOut * 100.0) / totalBars;
-                            if (pctFiltered > 10 || filteredOut > 1000)
-                            {
-                                // This indicates NinjaTrader returned data outside our date range
-                                // Get actual date range of returned data for diagnostics
-                                var minTime = req.Bars.GetTime(0);
-                                var maxTime = req.Bars.GetTime(req.Bars.Count - 1);
-                                capturedMsg = $"NT returned {totalBars:N0} bars ({minTime:yyyy-MM-dd} to {maxTime:yyyy-MM-dd}), filtered to {bars.Count:N0}";
-                            }
+                            // Terminator (length=0) signals EOF cleanly
+                            WriteUInt32LE(stream, 0);
+                            stream.Flush();
+                            job.Status = "complete";
+                            job.FinishedAt = DateTime.UtcNow;
                         }
+                        // Else: cancelled mid-stream -- outer finally tears down
                     }
-                    else if (err != ErrorCode.NoError)
+                }
+            }
+            catch (Exception ex)
+            {
+                // Network error mid-stream: file stays on disk, listener stays
+                // open, client can reconnect with offset = bytes already on disk.
+                Interrupt(job, ex.Message);
+            }
+        }
+
+        private static void Interrupt(TransferJob job, string err)
+        {
+            // Non-terminal: keeps the file alive for the next reconnect attempt.
+            job.Status = "interrupted";
+            job.Error = err;
+        }
+
+        private static void ExpireTransfer(TransferJob job)
+        {
+            try { job.Listener?.Stop(); } catch { }
+            try { job.Cts.Cancel(); } catch { }
+            job.Status = "expired";
+            job.FinishedAt = DateTime.UtcNow;
+            SafeDelete(job.TempPath);
+        }
+
+        // -------------------------------------------------------------------
+        // Stream resolution
+        // -------------------------------------------------------------------
+        //
+        // market_data_type is interpreted as:
+        //   "all"   -> [last, bid, ask]  (default; missing streams just contribute 0 bars)
+        //   "Last"  -> [last]
+        //   "Bid"   -> [bid]
+        //   "Ask"   -> [ask]
+        //
+        // We tag each pulled set with its lower-case price_type for the output's
+        // price_type column. This is the dimension Databento ohlcv doesn't have
+        // (their ohlcv is implicit "last") -- it's how we represent NT's natively
+        // 3-streamed model in a flat row-oriented file.
+
+        private static List<Tuple<string, MarketDataType>> ResolveStreams(string mdTypeStr)
+        {
+            var s = (mdTypeStr ?? "all").Trim().ToLowerInvariant();
+            switch (s)
+            {
+                case "all": return new List<Tuple<string, MarketDataType>>
+                {
+                    Tuple.Create("last", MarketDataType.Last),
+                    Tuple.Create("bid",  MarketDataType.Bid),
+                    Tuple.Create("ask",  MarketDataType.Ask),
+                };
+                case "last": return new List<Tuple<string, MarketDataType>> { Tuple.Create("last", MarketDataType.Last) };
+                case "bid":  return new List<Tuple<string, MarketDataType>> { Tuple.Create("bid",  MarketDataType.Bid)  };
+                case "ask":  return new List<Tuple<string, MarketDataType>> { Tuple.Create("ask",  MarketDataType.Ask)  };
+                default: throw new ArgumentException($"market_data_type must be all|Last|Bid|Ask, got '{mdTypeStr}'");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Format writers — unified schema, Databento-compatible
+        // -------------------------------------------------------------------
+        //
+        // All formats produce the same logical row shape:
+        //
+        //   ts_event   (TIMESTAMP UTC, nanosecond precision in CSV via int64)
+        //   symbol     (full instrument name, e.g. "MNQ 06-26")
+        //   price_type ('last' | 'bid' | 'ask')
+        //   source     ('nt')   -- provenance flag; Databento data uses 'databento'
+        //   open, high, low, close   (DOUBLE)
+        //   volume     (BIGINT)
+        //
+        // For the row primary key: (price_type, ts_event) -- same bar timestamp
+        // can exist in multiple streams. Databento ohlcv is implicit "last" only,
+        // so when joining NT+Databento corpora, filter NT to price_type='last'.
+
+        private static void WriteTransferCsv(string symbol, List<StreamBars> allBars, string path)
+        {
+            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var utf8NoBom = new UTF8Encoding(false);
+            using (var w = new StreamWriter(path, false, utf8NoBom))
+            {
+                w.WriteLine("ts_event_ns,symbol,price_type,source,open,high,low,close,volume");
+                foreach (var stream in allBars)
+                {
+                    foreach (var b in stream.Bars)
                     {
-                        capturedMsg = msg;
+                        long nsSinceEpoch = (long)((b.Time.ToUniversalTime() - epoch).Ticks) * 100L;
+                        w.WriteLine($"{nsSinceEpoch},{EscapeCsv(symbol)},{stream.PriceType},nt,"
+                                    + $"{b.Open},{b.High},{b.Low},{b.Close},{b.Volume}");
                     }
-                    wait.Set();
-                });
-
-                wait.WaitOne(TimeSpan.FromMinutes(5));
-                diagnosticMsg = capturedMsg;
-            }
-            catch { }
-
-            return bars;
-        }
-
-        private List<OHLCBar> MergeAndDedupe(List<OHLCBar> bars)
-        {
-            if (bars.Count == 0) return bars;
-
-            // Sort by time
-            var sorted = bars.OrderBy(b => b.Time).ToList();
-
-            // Dedupe: keep bar with highest volume for each timestamp
-            var result = new List<OHLCBar>();
-            OHLCBar prev = null;
-
-            foreach (var bar in sorted)
-            {
-                if (prev == null || bar.Time != prev.Time)
-                {
-                    result.Add(bar);
-                    prev = bar;
-                }
-                else if (bar.Volume > prev.Volume)
-                {
-                    // Same timestamp, keep higher volume (front month)
-                    result[result.Count - 1] = bar;
-                    prev = bar;
-                }
-            }
-
-            return result;
-        }
-
-        private void WriteOHLCFile(string path, List<OHLCBar> bars)
-        {
-            using (var w = new StreamWriter(path, false, Encoding.UTF8))
-            {
-                w.WriteLine("unix_ms,open,high,low,close,volume");
-
-                foreach (var bar in bars)
-                {
-                    long unixMs = (long)(bar.Time.ToUniversalTime() - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
-                    w.WriteLine($"{unixMs},{bar.Open},{bar.High},{bar.Low},{bar.Close},{bar.Volume}");
                 }
             }
         }
 
-        private void Log(string msg, bool isError = false)
+        private static string EscapeCsv(string s)
         {
-            Dispatcher.Invoke(() =>
-            {
-                statusBlock.Text += (statusBlock.Text.Length > 0 ? "\n" : "") + msg;
-                statusBlock.Foreground = isError ? Brushes.OrangeRed : Brushes.LightGreen;
-                statusScroll.ScrollToEnd();
-            });
+            if (s == null) return "";
+            if (s.IndexOfAny(new[] { ',', '"', '\n', '\r' }) < 0) return s;
+            return "\"" + s.Replace("\"", "\"\"") + "\"";
         }
 
-        private void Finish()
+        private static void WriteTransferDuckDb(string symbol, List<StreamBars> allBars, string path)
         {
-            Dispatcher.Invoke(() =>
-            {
-                running = false;
-                exportBtn.IsEnabled = true;
-                progressBar.Visibility = Visibility.Collapsed;
-            });
-        }
-
-        // Made internal (was private) so AddOn-side RPC handlers can iterate
-        // results from the now-static GetOHLCFromContract.
-        internal class OHLCBar
-        {
-            public DateTime Time;
-            public double Open, High, Low, Close, Volume;
-        }
-
-        private void ExportToDuckDb(string symbolRoot, string tfType, string outDir,
-            List<OHLCBar> lastBars, List<OHLCBar> bidBars, List<OHLCBar> askBars, bool replaceExisting)
-        {
-            DuckDBConnection connection = null;
-
+            DuckDBConnection cnx = null;
             try
             {
-                // Determine table name based on timeframe
-                string tableName = tfType switch
-                {
-                    "Tick" => "ticks",
-                    "Day" => "days",
-                    _ => "minutes"
-                };
-
-                // Create symbol subdirectory
-                string symbolDir = Path.Combine(outDir, symbolRoot);
-                if (!Directory.Exists(symbolDir))
-                    Directory.CreateDirectory(symbolDir);
-
-                string dbPath = Path.Combine(symbolDir, $"{symbolRoot}.db");
-                Log($"\nExporting to DuckDB: {symbolRoot}/{Path.GetFileName(dbPath)}");
-                Log($"Table: {tableName}");
-                Log($"Mode: {(replaceExisting ? "REPLACE all existing data" : "MERGE with existing data")}");
-
-                connection = new DuckDBConnection($"Data Source={dbPath}");
-                connection.Open();
-
-                // Create table if not exists
-                ExecuteNonQuery(connection, $@"
-                    CREATE TABLE IF NOT EXISTS {tableName} (
+                cnx = new DuckDBConnection($"Data Source={path}");
+                cnx.Open();
+                ExecuteNonQueryStatic(cnx, @"
+                    CREATE TABLE bars (
+                        ts_event    TIMESTAMP NOT NULL,
                         symbol      VARCHAR NOT NULL,
                         price_type  VARCHAR NOT NULL,
-                        unix_ms     BIGINT NOT NULL,
-                        timestamp   TIMESTAMP NOT NULL,
+                        source      VARCHAR NOT NULL DEFAULT 'nt',
                         open        DOUBLE NOT NULL,
                         high        DOUBLE NOT NULL,
                         low         DOUBLE NOT NULL,
                         close       DOUBLE NOT NULL,
                         volume      BIGINT NOT NULL,
-                        PRIMARY KEY (symbol, price_type, unix_ms)
+                        PRIMARY KEY (price_type, ts_event)
                     )");
-
-                // If replaceExisting is checked, delete all existing data for this symbol
-                // Otherwise, we merge using INSERT OR REPLACE (keeps existing, updates duplicates)
-                if (replaceExisting)
-                {
-                    Log($"  Deleting existing data for {symbolRoot}...");
-                    ExecuteNonQuery(connection, $"DELETE FROM {tableName} WHERE symbol = '{symbolRoot}'");
-                }
-
-                // Insert data for each price type
-                int totalInserted = 0;
-
-                if (lastBars.Count > 0)
-                {
-                    int inserted = InsertOHLCData(connection, tableName, symbolRoot, "last", lastBars);
-                    Log($"  Inserted {inserted:N0} 'last' bars");
-                    totalInserted += inserted;
-                }
-
-                if (bidBars.Count > 0)
-                {
-                    int inserted = InsertOHLCData(connection, tableName, symbolRoot, "bid", bidBars);
-                    Log($"  Inserted {inserted:N0} 'bid' bars");
-                    totalInserted += inserted;
-                }
-
-                if (askBars.Count > 0)
-                {
-                    int inserted = InsertOHLCData(connection, tableName, symbolRoot, "ask", askBars);
-                    Log($"  Inserted {inserted:N0} 'ask' bars");
-                    totalInserted += inserted;
-                }
-
-                Log($"✓ DuckDB: {totalInserted:N0} total rows in '{tableName}' table");
-            }
-            catch (Exception ex)
-            {
-                Log($"DuckDB error: {ex.Message}", true);
-                if (ex.InnerException != null)
-                    Log($"  Inner: {ex.InnerException.Message}", true);
+                foreach (var stream in allBars)
+                    InsertBarsStatic(cnx, "bars", symbol, stream.PriceType, stream.Bars);
             }
             finally
             {
-                // Manual cleanup
-                if (connection != null)
-                {
-                    try { connection.Close(); } catch { }
-                    try { connection.Dispose(); } catch { }
-                }
+                if (cnx != null) { try { cnx.Close(); } catch { } try { cnx.Dispose(); } catch { } }
             }
         }
 
-        private void ExecuteNonQuery(DuckDBConnection connection, string sql)
+        private static void WriteTransferParquet(string symbol, List<StreamBars> allBars, string path)
         {
-            var cmd = connection.CreateCommand();
+            // No Parquet.Net NuGet -- pipe through DuckDB COPY TO.
+            string tmpDb = path + ".tmpdb";
             try
             {
-                cmd.CommandText = sql;
-                cmd.ExecuteNonQuery();
+                WriteTransferDuckDb(symbol, allBars, tmpDb);
+                DuckDBConnection cnx = null;
+                try
+                {
+                    cnx = new DuckDBConnection($"Data Source={tmpDb}");
+                    cnx.Open();
+                    // ORDER BY (price_type, ts_event) so consumers can stream-read
+                    // grouped by stream without an extra sort pass.
+                    var sql = $"COPY (SELECT ts_event, symbol, price_type, source, open, high, low, close, volume "
+                            + $"FROM bars ORDER BY price_type, ts_event) "
+                            + $"TO '{path.Replace("'", "''")}' (FORMAT PARQUET, COMPRESSION SNAPPY)";
+                    ExecuteNonQueryStatic(cnx, sql);
+                }
+                finally
+                {
+                    if (cnx != null) { try { cnx.Close(); } catch { } try { cnx.Dispose(); } catch { } }
+                }
             }
             finally
             {
-                try { cmd.Dispose(); } catch { }
+                SafeDelete(tmpDb);
             }
         }
 
-        private int InsertOHLCData(DuckDBConnection connection, string tableName, string symbol, string priceType, List<OHLCBar> bars)
+        // Static analogs of the instance helpers on ExportOHLCWindow -- needed
+        // because the AddOn class is independent of the Window class instance.
+        private static void ExecuteNonQueryStatic(DuckDBConnection cnx, string sql)
         {
-            if (bars.Count == 0) return 0;
+            var cmd = cnx.CreateCommand();
+            try { cmd.CommandText = sql; cmd.ExecuteNonQuery(); }
+            finally { try { cmd.Dispose(); } catch { } }
+        }
 
+        private static void InsertBarsStatic(DuckDBConnection cnx, string tableName,
+            string symbol, string priceType, List<ExportOHLCWindow.OHLCBar> bars)
+        {
+            if (bars.Count == 0) return;
             int chunkSize = 1000;
-            int inserted = 0;
-
+            // Escape symbol for SQL literal (handles "MNQ 06-26" -- space is fine,
+            // but defensively quote anything that has special chars). Single-quote
+            // escape via doubling.
+            string sym = symbol.Replace("'", "''");
             for (int i = 0; i < bars.Count; i += chunkSize)
             {
-                var chunk = bars.Skip(i).Take(chunkSize).ToList();
+                int n = Math.Min(chunkSize, bars.Count - i);
                 var sb = new StringBuilder();
-                sb.AppendLine($"INSERT OR REPLACE INTO {tableName} (symbol, price_type, unix_ms, timestamp, open, high, low, close, volume) VALUES");
-
-                for (int j = 0; j < chunk.Count; j++)
+                sb.Append($"INSERT OR REPLACE INTO {tableName} (ts_event, symbol, price_type, source, open, high, low, close, volume) VALUES ");
+                for (int j = 0; j < n; j++)
                 {
-                    var bar = chunk[j];
-                    long unixMs = (long)(bar.Time.ToUniversalTime() - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
-                    string timestamp = bar.Time.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.fff");
-
+                    var b = bars[i + j];
+                    // DuckDB TIMESTAMP literal: 'YYYY-MM-DD HH:MM:SS.ffffff' (microseconds)
+                    string ts = b.Time.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.ffffff");
                     if (j > 0) sb.Append(",");
-                    sb.AppendLine($"('{symbol}', '{priceType}', {unixMs}, '{timestamp}', {bar.Open}, {bar.High}, {bar.Low}, {bar.Close}, {bar.Volume})");
+                    sb.Append($"(TIMESTAMP '{ts}','{sym}','{priceType}','nt',{b.Open},{b.High},{b.Low},{b.Close},{b.Volume})");
                 }
-
-                ExecuteNonQuery(connection, sb.ToString());
-                inserted += chunk.Count;
+                ExecuteNonQueryStatic(cnx, sb.ToString());
             }
+        }
 
-            return inserted;
+        // -------------------------------------------------------------------
+        // Wire helpers
+        // -------------------------------------------------------------------
+
+        private static byte[] ReadExact(NetworkStream s, int n)
+        {
+            var buf = new byte[n];
+            int off = 0;
+            while (off < n)
+            {
+                int r = s.Read(buf, off, n - off);
+                if (r <= 0) return null;
+                off += r;
+            }
+            return buf;
+        }
+
+        private static void WriteHandshakeReply(NetworkStream s, byte status, ulong remaining)
+        {
+            var reply = new byte[9];
+            reply[0] = status;
+            Buffer.BlockCopy(BitConverter.GetBytes(remaining), 0, reply, 1, 8);
+            s.Write(reply, 0, 9);
+            s.Flush();
+        }
+
+        private static void WriteUInt32LE(NetworkStream s, uint v)
+        {
+            var b = BitConverter.GetBytes(v); // little-endian on Intel
+            s.Write(b, 0, 4);
+        }
+
+        private static bool ConstantTimeEq(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+            return diff == 0;
+        }
+
+        // -------------------------------------------------------------------
+        // File helpers
+        // -------------------------------------------------------------------
+
+        private static void GzipFile(string srcPath, string gzPath)
+        {
+            using (var src = new FileStream(srcPath, FileMode.Open, FileAccess.Read))
+            using (var dst = new FileStream(gzPath, FileMode.Create, FileAccess.Write))
+            using (var gz = new GZipStream(dst, CompressionLevel.Optimal, leaveOpen: false))
+                src.CopyTo(gz);
+        }
+
+        private static string Sha256Hex(string path)
+        {
+            using (var sha = SHA256.Create())
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
+            {
+                var hash = sha.ComputeHash(fs);
+                var sb = new StringBuilder(hash.Length * 2);
+                foreach (var bt in hash) sb.Append(bt.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
+        private static string HexEncode(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 2);
+            foreach (var b in bytes) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+
+        private static void SafeDelete(string path)
+        {
+            try { if (path != null && File.Exists(path)) File.Delete(path); } catch { }
+        }
+
+        private static string SafeFileName(string s)
+        {
+            foreach (var c in Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
+            return s.Replace(' ', '_');
+        }
+
+        private static string FormatExtension(string format)
+        {
+            switch (format)
+            {
+                case "csv":     return "csv";
+                case "duckdb":  return "db";
+                case "parquet": return "parquet";
+                default:        return "bin";
+            }
         }
     }
 }
