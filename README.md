@@ -1,6 +1,6 @@
 # ExportOHLC
 
-**Version: 1.10.2**
+**Version: 1.10.3**
 **Last Updated: 2026-06-10**
 
 A NinjaTrader 8 AddOn that exports historical futures data (Tick / 1-Minute / Day OHLCV) from the local NT cache across **all contract months** of a symbol, stitched into a continuous series with **front-month-wins** dedup at roll boundaries.
@@ -47,18 +47,45 @@ Uses C# `partial void` hooks — the base file declares them, this file implemen
 
 ## Installation
 
-1. Copy the `.cs` file(s) you want into NT's AddOn directory:
+### Recommended: run the installer script
+
+PowerShell from this repo directory:
+
+```powershell
+# After ensuring NinjaTrader 8 is closed:
+.\Install-NinjaExportOHLC.ps1                  # base AddOn only
+.\Install-NinjaExportOHLC.ps1 -IncludePlexus   # also install Plexus partial
+```
+
+The script:
+- Verifies NT 8 is installed and not running
+- Confirms `DuckDB.NET.Data.dll`, `DuckDB.NET.Bindings.dll`, `duckdb.dll` (native x64), and `System.Memory.dll` are findable in NT's bin paths — reports download URLs if any are missing
+- Backs up `Documents\NinjaTrader 8\Config.xml`
+- Adds `<string>System.Numerics.dll</string>` and `<string>*ProgramFiles*\NinjaTrader 8\bin\Custom\System.Memory.dll</string>` to the References section (idempotent — re-running won't duplicate)
+- Copies `ExportOHLC.cs` (and optionally `ExportOHLC.Plexus.cs`) to `Documents\NinjaTrader 8\bin\Custom\AddOns\`
+- Removes any obsolete `ExportOHLCTransfer.cs` (pre-1.9.0 layout)
+
+Then: **start NT → NinjaScript Editor → F5**. Menu item appears under **Control Center → New / Tools**.
+
+### Manual install
+
+If you'd rather not run the script:
+
+1. Copy `.cs` files into `%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\`
+   - **Required:** `ExportOHLC.cs`
+   - **Optional (Plexus bus):** `ExportOHLC.Plexus.cs`
+2. Place native + managed dependencies in `%ProgramFiles%\NinjaTrader 8\bin\Custom\` (or `Documents\NinjaTrader 8\bin\Custom\`):
+   - `DuckDB.NET.Data.dll` — from [Giorgi/DuckDB.NET releases](https://github.com/Giorgi/DuckDB.NET/releases)
+   - `DuckDB.NET.Bindings.dll` — same release
+   - `System.Memory.dll` — same release
+   - `duckdb.dll` (native x64) — from [duckdb.org/docs/installation](https://duckdb.org/docs/installation/) (Windows / C/C++ API / x64)
+3. Edit `%USERPROFILE%\Documents\NinjaTrader 8\Config.xml`, inside `<References><ArrayOfString>...</ArrayOfString></References>`, add two lines:
+   ```xml
+   <string>System.Numerics.dll</string>
+   <string>*ProgramFiles*\NinjaTrader 8\bin\Custom\System.Memory.dll</string>
    ```
-   %USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\
-   ```
-   - **Minimum:** `ExportOHLC.cs`
-   - **With Plexus bus:** also copy `ExportOHLC.Plexus.cs`
-2. Native dependencies (place in NT's `bin\` folder):
-   - `DuckDB.NET.Data.dll`
-   - `DuckDB.NET.Bindings.dll`
-   - `duckdb.dll` (native x64)
-3. In NT: **Tools → NinjaScript Editor → F5** (or Compile button)
-4. Restart NT or wait for the AddOn to load — menu item appears under **Control Center → New / Tools**
+   These are needed because `DuckDB.NET`'s `IDuckDBAppenderRow.AppendValue` declares overloads using `Span<byte>` (in `System.Memory`) and `BigInteger?` (in `System.Numerics`). The C# compiler must load those types for overload resolution even though we never call those overloads.
+4. **NinjaScript Editor → F5** to compile.
 
 ## Usage
 
@@ -168,9 +195,10 @@ To force a full refetch: check **"Replace existing data"** before clicking EXPOR
 
 ## Version history
 
-- **1.10.2** — Reverted Appender API (needed `System.Memory` / `System.Numerics` references NT8 doesn't ship); replaced with **transaction-wrapped INSERTs**: one `BEGIN`/`COMMIT` per (contract, mdtype) batches the disk flush, much faster than the 1.9.x per-INSERT autocommit
+- **1.10.3** — Switched staging back to DuckDB's binary `Appender` API now that `Install-NinjaExportOHLC.ps1` wires the missing `System.Numerics` / `System.Memory` references into Config.xml. **Measured ~100× speedup on tick volumes** vs 1.10.2's transaction-wrapped INSERTs
+- **1.10.2** — Transaction-wrapped INSERTs (Appender attempt rolled back; needed missing assembly refs)
 - **1.10.1** — Restored missing `using DuckDB.NET.Data;` (lost during the Plexus split)
-- **1.10.0** — *(broken)* Tried DuckDB binary Appender API — wouldn't compile on stock NT8 (`Span<>` / `BigInteger` overload resolution refs)
+- **1.10.0** — *(broken)* First Appender attempt — wouldn't compile on stock NT8 (`Span<>` / `BigInteger` overload resolution refs)
 - **1.9.2** — Schema migration ALTER without `NOT NULL` constraint (DuckDB limitation)
 - **1.9.1** — Added `contract` column for audit trail; CSV/Parquet/DuckDB all expose it
 - **1.9.0** — `export_progress` table for resumability; per-contract atomic merge; selectable status log; DatePicker dark theme; `yyyy-MM-dd` dates
