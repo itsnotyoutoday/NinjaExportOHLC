@@ -1,6 +1,6 @@
 # ExportOHLC
 
-**Version: 1.10.0**
+**Version: 1.10.1**
 **Last Updated: 2026-06-10**
 
 A NinjaTrader 8 AddOn that exports historical futures data (Tick / 1-Minute / Day OHLCV) from the local NT cache across **all contract months** of a symbol, stitched into a continuous series with **front-month-wins** dedup at roll boundaries.

@@ -15,6 +15,7 @@ using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
+using DuckDB.NET.Data;
 #endregion
 
 
@@ -50,7 +51,7 @@ namespace NinjaTrader.NinjaScript.AddOns
     /// Note: Bid/Ask data availability depends on your data provider.
     /// Some providers only supply Last (trade) data.
     ///
-    /// Version: 1.10.0
+    /// Version: 1.10.1
     /// Last Updated: 2026-06-10
     /// </summary>
     public partial class ExportOHLCAddOn : AddOnBase
