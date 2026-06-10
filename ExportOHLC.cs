@@ -51,7 +51,7 @@ namespace NinjaTrader.NinjaScript.AddOns
     /// Note: Bid/Ask data availability depends on your data provider.
     /// Some providers only supply Last (trade) data.
     ///
-    /// Version: 1.10.1
+    /// Version: 1.10.2
     /// Last Updated: 2026-06-10
     /// </summary>
     public partial class ExportOHLCAddOn : AddOnBase
@@ -1192,46 +1192,68 @@ namespace NinjaTrader.NinjaScript.AddOns
             return totalStaged;
         }
 
-        // Bulk insert into the no-PK staging table using DuckDB's native
-        // binary Appender API instead of string-built INSERT statements.
+        // Bulk insert into the no-PK staging table, wrapped in a single
+        // transaction so DuckDB batches the disk flush instead of flushing
+        // after every chunk-INSERT. Drops the per-chunk overhead enormously
+        // for tick data.
         //
-        // Why: the prior multi-row INSERT approach measured ~300 bars/sec for
-        // tick data (1M-bar chunks took 60+ minutes to stage). The Appender
-        // pushes binary values directly through DuckDB's C API, skipping the
-        // SQL parser, type-coercer, and per-statement transaction flush.
-        // Realistic speedup: 100×+ — tick chunks should now finish in seconds.
+        // Why not the DuckDB Appender API (would be even faster):
+        // DuckDB.NET's IDuckDBAppenderRow declares AppendValue overloads
+        // with Span<byte> and BigInteger? parameters. The C# compiler must
+        // load every overload's parameter type to do overload resolution,
+        // and NT8's NinjaScript compiler doesn't reference System.Memory
+        // or System.Numerics by default — so using the Appender produces
+        // CS0012 errors. Transactions are the portable second-best.
         //
-        // Column order MUST match the staging table schema exactly:
-        //   symbol, price_type, unix_ms, timestamp, open, high, low, close, volume
+        // Tunables: chunkSize=5000 keeps each INSERT's SQL under ~500KB
+        // (DuckDB parses fast at that size). One BEGIN/COMMIT per call
+        // amortizes commit cost over all chunks for this (contract, mdtype).
         private int InsertBarsToStaging(DuckDBConnection connection, string stagingTable, string symbol, string priceType, List<OHLCBar> bars)
         {
             if (bars.Count == 0) return 0;
 
+            int chunkSize = 5000;
+            int processed = 0;
             var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-            using (var appender = connection.CreateAppender(stagingTable))
+            ExecuteNonQuery(connection, "BEGIN TRANSACTION");
+            bool committed = false;
+            try
             {
-                foreach (var bar in bars)
+                for (int i = 0; i < bars.Count; i += chunkSize)
                 {
-                    DateTime ts = bar.Time.ToUniversalTime();
-                    long unixMs = (long)(ts - epoch).TotalMilliseconds;
-                    long volume = (long)bar.Volume; // staging schema = BIGINT
+                    int end = Math.Min(i + chunkSize, bars.Count);
+                    var sb = new StringBuilder(chunkSize * 90);
+                    sb.Append($"INSERT INTO {stagingTable} (symbol, price_type, unix_ms, timestamp, open, high, low, close, volume) VALUES ");
 
-                    appender.CreateRow()
-                        .AppendValue(symbol)
-                        .AppendValue(priceType)
-                        .AppendValue(unixMs)
-                        .AppendValue(ts)
-                        .AppendValue(bar.Open)
-                        .AppendValue(bar.High)
-                        .AppendValue(bar.Low)
-                        .AppendValue(bar.Close)
-                        .AppendValue(volume)
-                        .EndRow();
+                    for (int j = i; j < end; j++)
+                    {
+                        var bar = bars[j];
+                        long unixMs = (long)(bar.Time.ToUniversalTime() - epoch).TotalMilliseconds;
+                        string timestamp = bar.Time.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.fff");
+
+                        if (j > i) sb.Append(',');
+                        sb.Append('(').Append('\'').Append(symbol).Append("','").Append(priceType).Append("',")
+                          .Append(unixMs).Append(",'").Append(timestamp).Append("',")
+                          .Append(bar.Open).Append(',').Append(bar.High).Append(',')
+                          .Append(bar.Low).Append(',').Append(bar.Close).Append(',')
+                          .Append(bar.Volume).Append(')');
+                    }
+
+                    ExecuteNonQuery(connection, sb.ToString());
+                    processed += (end - i);
                 }
-                appender.Close(); // explicit flush; using also disposes
+                ExecuteNonQuery(connection, "COMMIT");
+                committed = true;
             }
-            return bars.Count;
+            finally
+            {
+                if (!committed)
+                {
+                    try { ExecuteNonQuery(connection, "ROLLBACK"); } catch { }
+                }
+            }
+            return processed;
         }
 
         // Resume-after-crash check. Returns true if a prior export run
