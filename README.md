@@ -180,4 +180,4 @@ To force a full refetch: check **"Replace existing data"** before clicking EXPOR
 
 ## License
 
-(your project's license here)
+MIT — see [LICENSE](LICENSE).
